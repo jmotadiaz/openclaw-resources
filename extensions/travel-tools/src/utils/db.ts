@@ -1,0 +1,671 @@
+import Database from 'better-sqlite3';
+
+export interface ScoutRecord {
+  session_id: string;
+  site: string;
+  origin: string;
+  destination: string;
+  month: string;
+  date: string;
+  price: number;
+}
+
+export interface ItineraryRecord {
+  session_id: string;
+  site: string;
+  origin: string;
+  destination: string;
+  out_date: string;
+  ret_date?: string | null;
+  pax: number;
+  search_url?: string | null;
+}
+
+export interface FlightOptionRecord {
+  airline: string;
+  total_price: number;
+  out_dep_time: string;   // "HH:MM"
+  out_arr_time: string;   // "HH:MM"
+  out_duration?: string | null;
+  out_stops: number;
+  ret_dep_time?: string | null;
+  ret_arr_time?: string | null;
+  ret_duration?: string | null;
+  ret_stops?: number | null;
+}
+
+export interface FlightQueryParams {
+  session_id: string;
+  origin?: string;
+  destination?: string;
+  // Open-jaw: query multiple origin/destination pairs in one call.
+  // When provided, origin and destination above are ignored.
+  legs?: Array<{ origin: string; destination: string }>;
+  site?: string;
+  out_date?: string;
+  ret_date?: string;
+  min_price?: number;
+  max_price?: number;
+  max_stops?: number;
+  dep_from?: string;    // "HH:MM" inclusive lower bound on out_dep_time
+  dep_until?: string;   // "HH:MM" inclusive upper bound on out_dep_time
+  arr_until?: string;   // "HH:MM" inclusive upper bound on out_arr_time
+  airlines?: string[];
+  exclude_airlines?: string[];
+  sort_by?: 'price' | 'dep_time' | 'stops';
+  sort_dir?: 'asc' | 'desc';
+  limit?: number;
+}
+
+export interface CombinationResult {
+  out_date:         string;
+  ret_date?:        string;
+  out_price:        number;
+  ret_price?:       number;
+  total_price:      number;
+  trip_days?:       number;
+  session_id:       string;
+  // Populated for open-jaw results; absent for round-trips
+  ret_origin?:      string;
+  ret_destination?: string;
+}
+
+export interface QueryResultRow {
+  // itineraries columns
+  itinerary_id: number;
+  session_id: string;
+  site: string;
+  origin: string;
+  destination: string;
+  out_date: string;
+  ret_date: string | null;
+  pax: number;
+  search_url: string | null;
+  scraped_at: string;
+  // flight_options columns
+  option_id: number;
+  airline: string;
+  total_price: number;
+  out_dep_time: string;
+  out_arr_time: string;
+  out_duration: string | null;
+  out_stops: number;
+  ret_dep_time: string | null;
+  ret_arr_time: string | null;
+  ret_duration: string | null;
+  ret_stops: number | null;
+}
+
+// ─── Train interfaces ─────────────────────────────────────────────────────────
+
+export interface TrainItineraryRecord {
+  session_id:  string;
+  site:        string;  // 'kayak_train'
+  origin:      string;  // station code (lowercase)
+  destination: string;
+  out_date:    string;  // YYYY-MM-DD
+  ret_date?:   string | null;
+  adults:      number;
+  children?:   number[]; // ages, stored as JSON
+  search_url?: string | null;
+}
+
+export interface TrainOptionRecord {
+  operator:      string;  // e.g. "Renfe", "iryo", "SNCF"
+  total_price:   number;  // total for all passengers
+  out_dep_time:  string;  // "HH:MM"
+  out_arr_time:  string;
+  out_duration?: string | null; // "2h 40m"
+  out_changes:   number;  // number of changes (not "stops")
+  ret_dep_time?: string | null;
+  ret_arr_time?: string | null;
+  ret_duration?: string | null;
+  ret_changes?:  number | null;
+}
+
+export interface TrainQueryParams {
+  session_id:   string;
+  origin?:      string;
+  destination?: string;
+  legs?:        Array<{ origin: string; destination: string }>;
+  site?:        string;
+  out_date?:    string;
+  ret_date?:    string;
+  min_price?:   number;
+  max_price?:   number;
+  max_changes?: number;
+  sort_by?:     'price' | 'dep_time' | 'changes';
+  sort_dir?:    'asc' | 'desc';
+  limit?:       number;
+}
+
+export interface TrainQueryResultRow {
+  itinerary_id:  number;
+  session_id:    string;
+  site:          string;
+  origin:        string;
+  destination:   string;
+  out_date:      string;
+  ret_date:      string | null;
+  adults:        number;
+  children:      string | null; // JSON
+  search_url:    string | null;
+  scraped_at:    string;
+  option_id:     number;
+  operator:      string;
+  total_price:   number;
+  out_dep_time:  string;
+  out_arr_time:  string;
+  out_duration:  string | null;
+  out_changes:   number;
+  ret_dep_time:  string | null;
+  ret_arr_time:  string | null;
+  ret_duration:  string | null;
+  ret_changes:   number | null;
+}
+
+export class FlightDB {
+  private db: Database.Database;
+
+  constructor(dbPath: string) {
+    this.db = new Database(dbPath);
+    this.db.pragma('journal_mode = WAL');
+    this.initDB();
+  }
+
+  private initDB(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS scouts (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT NOT NULL,
+        site        TEXT NOT NULL,
+        origin      TEXT NOT NULL,
+        destination TEXT NOT NULL,
+        month       TEXT NOT NULL,
+        date        TEXT NOT NULL,
+        price       REAL NOT NULL,
+        timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(site, origin, destination, date, session_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS itineraries (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT NOT NULL,
+        site        TEXT NOT NULL,
+        origin      TEXT NOT NULL,
+        destination TEXT NOT NULL,
+        out_date    TEXT NOT NULL,
+        ret_date    TEXT,
+        pax         INTEGER NOT NULL DEFAULT 1,
+        search_url  TEXT,
+        scraped_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(session_id, site, origin, destination, out_date, ret_date)
+      );
+
+      CREATE TABLE IF NOT EXISTS flight_options (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        itinerary_id INTEGER NOT NULL REFERENCES itineraries(id) ON DELETE CASCADE,
+        airline      TEXT NOT NULL,
+        total_price  REAL NOT NULL,
+        out_dep_time TEXT NOT NULL,
+        out_arr_time TEXT NOT NULL,
+        out_duration TEXT,
+        out_stops    INTEGER NOT NULL DEFAULT 0,
+        ret_dep_time TEXT,
+        ret_arr_time TEXT,
+        ret_duration TEXT,
+        ret_stops    INTEGER,
+        UNIQUE(itinerary_id, airline, out_dep_time, ret_dep_time)
+      );
+
+      CREATE TABLE IF NOT EXISTS errors (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        site       TEXT,
+        session_id TEXT,
+        tool       TEXT,
+        error      TEXT,
+        context    TEXT,
+        timestamp  DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_fo_price    ON flight_options(itinerary_id, total_price);
+      CREATE INDEX IF NOT EXISTS idx_fo_dep_time ON flight_options(itinerary_id, out_dep_time);
+      CREATE INDEX IF NOT EXISTS idx_fo_stops    ON flight_options(itinerary_id, out_stops);
+      CREATE INDEX IF NOT EXISTS idx_itin_session
+        ON itineraries(session_id, origin, destination);
+
+      CREATE TABLE IF NOT EXISTS train_itineraries (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT NOT NULL,
+        site        TEXT NOT NULL,
+        origin      TEXT NOT NULL,
+        destination TEXT NOT NULL,
+        out_date    TEXT NOT NULL,
+        ret_date    TEXT,
+        adults      INTEGER NOT NULL DEFAULT 1,
+        children    TEXT,
+        search_url  TEXT,
+        scraped_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(session_id, site, origin, destination, out_date, ret_date)
+      );
+
+      CREATE TABLE IF NOT EXISTS train_options (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        itinerary_id INTEGER NOT NULL REFERENCES train_itineraries(id) ON DELETE CASCADE,
+        operator     TEXT NOT NULL,
+        total_price  REAL NOT NULL,
+        out_dep_time TEXT NOT NULL,
+        out_arr_time TEXT NOT NULL,
+        out_duration TEXT,
+        out_changes  INTEGER NOT NULL DEFAULT 0,
+        ret_dep_time TEXT,
+        ret_arr_time TEXT,
+        ret_duration TEXT,
+        ret_changes  INTEGER,
+        UNIQUE(itinerary_id, operator, out_dep_time, ret_dep_time)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_to_price    ON train_options(itinerary_id, total_price);
+      CREATE INDEX IF NOT EXISTS idx_to_dep_time ON train_options(itinerary_id, out_dep_time);
+      CREATE INDEX IF NOT EXISTS idx_ti_session  ON train_itineraries(session_id, origin, destination);
+    `);
+  }
+
+  insertScout(record: ScoutRecord) {
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO scouts
+      (site, origin, destination, month, date, price, session_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    return stmt.run(
+      record.site,
+      record.origin,
+      record.destination,
+      record.month,
+      record.date,
+      record.price,
+      record.session_id
+    );
+  }
+
+  queryScouts(origin: string, destination: string, months: string[]) {
+    const placeholders = months.map(() => '?').join(',');
+    const stmt = this.db.prepare(`
+      SELECT * FROM scouts
+      WHERE origin = ? AND destination = ? AND month IN (${placeholders})
+      ORDER BY date ASC
+    `);
+    return stmt.all(origin, destination, ...months) as ScoutRecord[];
+  }
+
+  upsertItinerary(rec: ItineraryRecord): number {
+    this.db.prepare(`
+      INSERT INTO itineraries
+        (session_id, site, origin, destination, out_date, ret_date, pax, search_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, site, origin, destination, out_date, ret_date)
+      DO UPDATE SET
+        search_url = excluded.search_url,
+        scraped_at = CURRENT_TIMESTAMP
+    `).run(
+      rec.session_id,
+      rec.site,
+      rec.origin.toLowerCase(),
+      rec.destination.toLowerCase(),
+      rec.out_date,
+      rec.ret_date ?? null,
+      rec.pax,
+      rec.search_url ?? null
+    );
+
+    // NOTE: Use `IS ?` not `= ?` — SQLite requires IS for NULL comparison
+    const row = this.db.prepare(`
+      SELECT id FROM itineraries
+      WHERE session_id = ?
+        AND site = ?
+        AND origin = ?
+        AND destination = ?
+        AND out_date = ?
+        AND ret_date IS ?
+    `).get(
+      rec.session_id,
+      rec.site,
+      rec.origin.toLowerCase(),
+      rec.destination.toLowerCase(),
+      rec.out_date,
+      rec.ret_date ?? null
+    ) as { id: number } | undefined;
+
+    if (!row) throw new Error(`upsertItinerary: could not retrieve id after upsert`);
+    return row.id;
+  }
+
+  insertFlightOption(itinerary_id: number, opt: FlightOptionRecord): void {
+    this.db.prepare(`
+      INSERT OR REPLACE INTO flight_options
+        (itinerary_id, airline, total_price,
+         out_dep_time, out_arr_time, out_duration, out_stops,
+         ret_dep_time, ret_arr_time, ret_duration, ret_stops)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      itinerary_id,
+      opt.airline,
+      opt.total_price,
+      opt.out_dep_time,
+      opt.out_arr_time,
+      opt.out_duration ?? null,
+      opt.out_stops,
+      opt.ret_dep_time ?? null,
+      opt.ret_arr_time ?? null,
+      opt.ret_duration ?? null,
+      opt.ret_stops ?? null
+    );
+  }
+
+  queryFlightOptions(params: FlightQueryParams): QueryResultRow[] {
+    const optionsPerItinerary = params.limit ?? 3;
+
+    // Build itinerary ID list — supports single route or multiple legs (open-jaw)
+    let itinIds: number[] = [];
+
+    const legs = params.legs && params.legs.length > 0
+      ? params.legs
+      : params.origin && params.destination
+        ? [{ origin: params.origin, destination: params.destination }]
+        : (() => { throw new Error('queryFlightOptions: provide either origin+destination or legs[]'); })();
+
+    const legConditions = legs.map(() => `(origin = ? AND destination = ?)`).join(' OR ');
+    const itinQ = `
+      SELECT id FROM itineraries
+      WHERE session_id = ?
+      AND (${legConditions})
+      ${params.site     ? 'AND site = ?'       : ''}
+      ${params.out_date ? 'AND out_date = ?'   : ''}
+      ${params.ret_date ? 'AND ret_date IS ?'  : ''}
+    `;
+    const itinP: any[] = [
+      params.session_id,
+      ...legs.flatMap(l => [l.origin.toLowerCase(), l.destination.toLowerCase()]),
+      ...(params.site     ? [params.site]     : []),
+      ...(params.out_date ? [params.out_date] : []),
+      ...(params.ret_date ? [params.ret_date] : [])
+    ];
+
+    itinIds = (this.db.prepare(itinQ).all(...itinP) as { id: number }[])
+      .map(r => r.id);
+
+    if (itinIds.length === 0) return [];
+
+    // 2. Top N opciones por itinerario, con filtros de vuelo
+    //    SQLite soporta ROW_NUMBER() desde v3.25 (2018)
+    const placeholders = itinIds.map(() => '?').join(',');
+
+    const orderCol =
+      params.sort_by === 'dep_time' ? 'fo.out_dep_time' :
+      params.sort_by === 'stops'    ? 'fo.out_stops'    :
+      'fo.total_price';
+    const orderDir = params.sort_dir === 'desc' ? 'DESC' : 'ASC';
+
+    let foFilters = '';
+    const foP: any[] = [...itinIds];
+
+    if (params.min_price != null)  { foFilters += ` AND fo.total_price >= ?`;  foP.push(params.min_price); }
+    if (params.max_price != null)  { foFilters += ` AND fo.total_price <= ?`;  foP.push(params.max_price); }
+    if (params.max_stops != null)  { foFilters += ` AND fo.out_stops <= ?`;    foP.push(params.max_stops); }
+    if (params.dep_from)           { foFilters += ` AND fo.out_dep_time >= ?`; foP.push(params.dep_from); }
+    if (params.dep_until)          { foFilters += ` AND fo.out_dep_time <= ?`; foP.push(params.dep_until); }
+    if (params.arr_until)          { foFilters += ` AND fo.out_arr_time <= ?`; foP.push(params.arr_until); }
+    if (params.airlines?.length) {
+      foFilters += ` AND fo.airline IN (${params.airlines.map(() => '?').join(',')})`;
+      foP.push(...params.airlines);
+    }
+    if (params.exclude_airlines?.length) {
+      foFilters += ` AND fo.airline NOT IN (${params.exclude_airlines.map(() => '?').join(',')})`;
+      foP.push(...params.exclude_airlines);
+    }
+
+    foP.push(optionsPerItinerary);
+
+    const q = `
+      SELECT
+        i.id AS itinerary_id, i.session_id, i.site,
+        i.origin, i.destination, i.out_date, i.ret_date,
+        i.pax, i.search_url, i.scraped_at,
+        fo.id AS option_id, fo.airline, fo.total_price,
+        fo.out_dep_time, fo.out_arr_time, fo.out_duration, fo.out_stops,
+        fo.ret_dep_time, fo.ret_arr_time, fo.ret_duration, fo.ret_stops,
+        ROW_NUMBER() OVER (
+          PARTITION BY fo.itinerary_id
+          ORDER BY ${orderCol} ${orderDir}
+        ) AS rn
+      FROM flight_options fo
+      JOIN itineraries i ON i.id = fo.itinerary_id
+      WHERE fo.itinerary_id IN (${placeholders})
+      ${foFilters}
+    `;
+
+    // Envolver en subquery para filtrar por rn
+    const wrapped = `SELECT * FROM (${q}) WHERE rn <= ?`;
+
+    return this.db.prepare(wrapped).all(...foP) as QueryResultRow[];
+  }
+
+  extractDateCombinations(params: {
+    origin: string;
+    destination: string;
+    months: string[];
+    min_days: number;
+    max_days: number;
+    top: number;
+    session_id: string;
+    // Open-jaw: return leg departs from a different city
+    // If omitted, defaults to round-trip (destination→origin)
+    return_origin?:      string;
+    return_destination?: string;
+  }): CombinationResult[] {
+    const rawOutDates = this.queryScouts(params.origin, params.destination, params.months);
+
+    // For open-jaw: use the explicit return route.
+    // For round-trip: default to destination→origin.
+    const retOrigin      = params.return_origin      ?? params.destination;
+    const retDestination = params.return_destination ?? params.origin;
+    const rawRetDates    = this.queryScouts(retOrigin, retDestination, params.months);
+
+    // Deduplicate: keep cheapest price per date
+    const dedupe = (rows: ScoutRecord[]) => {
+      const map = new Map<string, ScoutRecord>();
+      for (const d of rows) {
+        if (!map.has(d.date) || d.price < map.get(d.date)!.price) map.set(d.date, d);
+      }
+      return Array.from(map.values());
+    };
+
+    const outDates = dedupe(rawOutDates);
+    const retDates = dedupe(rawRetDates);
+
+    if (outDates.length === 0 && retDates.length === 0)
+      throw new Error(`No scout data for either route. Did the Scout phase complete?`);
+    if (outDates.length === 0)
+      throw new Error(`No outbound scout data for ${params.origin}->${params.destination}.`);
+    if (retDates.length === 0)
+      throw new Error(`No return scout data for ${retOrigin}->${retDestination}.`);
+
+    const combinations: CombinationResult[] = [];
+
+    for (const out of outDates) {
+      for (const ret of retDates) {
+        const diffDays = Math.ceil(
+          (new Date(ret.date).getTime() - new Date(out.date).getTime()) / 86_400_000
+        );
+        if (diffDays >= params.min_days && diffDays <= params.max_days) {
+          combinations.push({
+            out_date:    out.date,
+            ret_date:    ret.date,
+            out_price:   out.price,
+            ret_price:   ret.price,
+            total_price: out.price + ret.price,
+            trip_days:   diffDays,
+            session_id:  params.session_id,
+            // Only set for open-jaw (when return route differs from default B→A)
+            ...(params.return_origin      ? { ret_origin:      params.return_origin }      : {}),
+            ...(params.return_destination ? { ret_destination: params.return_destination } : {})
+          });
+        }
+      }
+    }
+
+    return combinations
+      .sort((a, b) => a.total_price - b.total_price)
+      .slice(0, params.top);
+  }
+
+  // ─── Train CRUD ─────────────────────────────────────────────────────────────
+
+  upsertTrainItinerary(rec: TrainItineraryRecord): number {
+    this.db.prepare(`
+      INSERT INTO train_itineraries
+        (session_id, site, origin, destination, out_date, ret_date, adults, children, search_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, site, origin, destination, out_date, ret_date)
+      DO UPDATE SET
+        search_url = excluded.search_url,
+        scraped_at = CURRENT_TIMESTAMP
+    `).run(
+      rec.session_id,
+      rec.site,
+      rec.origin.toLowerCase(),
+      rec.destination.toLowerCase(),
+      rec.out_date,
+      rec.ret_date ?? null,
+      rec.adults,
+      rec.children ? JSON.stringify(rec.children) : null,
+      rec.search_url ?? null
+    );
+
+    const row = this.db.prepare(`
+      SELECT id FROM train_itineraries
+      WHERE session_id = ?
+        AND site = ?
+        AND origin = ?
+        AND destination = ?
+        AND out_date = ?
+        AND ret_date IS ?
+    `).get(
+      rec.session_id,
+      rec.site,
+      rec.origin.toLowerCase(),
+      rec.destination.toLowerCase(),
+      rec.out_date,
+      rec.ret_date ?? null
+    ) as { id: number } | undefined;
+
+    if (!row) throw new Error(`upsertTrainItinerary: could not retrieve id after upsert`);
+    return row.id;
+  }
+
+  insertTrainOption(itinerary_id: number, opt: TrainOptionRecord): void {
+    this.db.prepare(`
+      INSERT OR REPLACE INTO train_options
+        (itinerary_id, operator, total_price,
+         out_dep_time, out_arr_time, out_duration, out_changes,
+         ret_dep_time, ret_arr_time, ret_duration, ret_changes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      itinerary_id,
+      opt.operator,
+      opt.total_price,
+      opt.out_dep_time,
+      opt.out_arr_time,
+      opt.out_duration ?? null,
+      opt.out_changes,
+      opt.ret_dep_time ?? null,
+      opt.ret_arr_time ?? null,
+      opt.ret_duration ?? null,
+      opt.ret_changes ?? null
+    );
+  }
+
+  queryTrainOptions(params: TrainQueryParams): TrainQueryResultRow[] {
+    const optionsPerItinerary = params.limit ?? 3;
+
+    const legs = params.legs && params.legs.length > 0
+      ? params.legs
+      : params.origin && params.destination
+        ? [{ origin: params.origin, destination: params.destination }]
+        : (() => { throw new Error('queryTrainOptions: provide either origin+destination or legs[]'); })();
+
+    const legConditions = legs.map(() => `(origin = ? AND destination = ?)`).join(' OR ');
+    const itinQ = `
+      SELECT id FROM train_itineraries
+      WHERE session_id = ?
+      AND (${legConditions})
+      ${params.site     ? 'AND site = ?'      : ''}
+      ${params.out_date ? 'AND out_date = ?' : ''}
+      ${params.ret_date ? 'AND ret_date IS ?' : ''}
+    `;
+    const itinP: any[] = [
+      params.session_id,
+      ...legs.flatMap(l => [l.origin.toLowerCase(), l.destination.toLowerCase()]),
+      ...(params.site     ? [params.site]     : []),
+      ...(params.out_date ? [params.out_date] : []),
+      ...(params.ret_date ? [params.ret_date] : [])
+    ];
+
+    const itinIds = (this.db.prepare(itinQ).all(...itinP) as { id: number }[])
+      .map(r => r.id);
+
+    if (itinIds.length === 0) return [];
+
+    const placeholders = itinIds.map(() => '?').join(',');
+
+    const orderCol =
+      params.sort_by === 'dep_time' ? 'to_.out_dep_time' :
+      params.sort_by === 'changes'  ? 'to_.out_changes'  :
+      'to_.total_price';
+    const orderDir = params.sort_dir === 'desc' ? 'DESC' : 'ASC';
+
+    let toFilters = '';
+    const toP: any[] = [...itinIds];
+
+    if (params.min_price   != null) { toFilters += ` AND to_.total_price >= ?`;  toP.push(params.min_price); }
+    if (params.max_price   != null) { toFilters += ` AND to_.total_price <= ?`;  toP.push(params.max_price); }
+    if (params.max_changes != null) { toFilters += ` AND to_.out_changes <= ?`; toP.push(params.max_changes); }
+
+    toP.push(optionsPerItinerary);
+
+    const q = `
+      SELECT
+        ti.id AS itinerary_id, ti.session_id, ti.site,
+        ti.origin, ti.destination, ti.out_date, ti.ret_date,
+        ti.adults, ti.children, ti.search_url, ti.scraped_at,
+        to_.id AS option_id, to_.operator, to_.total_price,
+        to_.out_dep_time, to_.out_arr_time, to_.out_duration, to_.out_changes,
+        to_.ret_dep_time, to_.ret_arr_time, to_.ret_duration, to_.ret_changes,
+        ROW_NUMBER() OVER (
+          PARTITION BY to_.itinerary_id
+          ORDER BY ${orderCol} ${orderDir}
+        ) AS rn
+      FROM train_options to_
+      JOIN train_itineraries ti ON ti.id = to_.itinerary_id
+      WHERE to_.itinerary_id IN (${placeholders})
+      ${toFilters}
+    `;
+
+    const wrapped = `SELECT * FROM (${q}) WHERE rn <= ?`;
+    return this.db.prepare(wrapped).all(...toP) as TrainQueryResultRow[];
+  }
+
+  // ─── Error logging ──────────────────────────────────────────────────────────
+
+  logError(site: string, session_id: string, tool: string, error: string, context?: any) {
+    const stmt = this.db.prepare(`
+      INSERT INTO errors (site, session_id, tool, error, context)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    return stmt.run(site, session_id, tool, error, context ? JSON.stringify(context) : null);
+  }
+
+  close() {
+    this.db.close();
+  }
+}

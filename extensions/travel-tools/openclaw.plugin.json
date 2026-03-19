@@ -1,0 +1,14 @@
+{
+  "id": "travel-tools",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "dbPath": {
+        "type": "string",
+        "description": "Ruta absoluta a travel.sqlite",
+        "default": "/home/openclaw/.openclaw/workspace/travel.sqlite"
+      }
+    }
+  }
+}
