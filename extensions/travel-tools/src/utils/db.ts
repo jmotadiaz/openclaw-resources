@@ -50,8 +50,6 @@ export interface FlightQueryParams {
   session_id: string;
   origin?: string;
   destination?: string;
-  // Open-jaw: query multiple origin/destination pairs in one call.
-  // When provided, origin and destination above are ignored.
   legs?: Array<{ origin: string; destination: string }>;
   site?: string;
   out_date?: string;
@@ -59,9 +57,9 @@ export interface FlightQueryParams {
   min_price?: number;
   max_price?: number;
   max_stops?: number;
-  dep_from?: string;    // "HH:MM" inclusive lower bound on out_dep_time
-  dep_until?: string;   // "HH:MM" inclusive upper bound on out_dep_time
-  arr_until?: string;   // "HH:MM" inclusive upper bound on out_arr_time
+  dep_from?: string;
+  dep_until?: string;
+  arr_until?: string;
   airlines?: string[];
   exclude_airlines?: string[];
   sort_by?: 'price' | 'dep_time' | 'stops';
@@ -77,7 +75,6 @@ export interface CombinationResult {
   total_price:      number;
   trip_days?:       number;
   session_id:       string;
-  // Populated for open-jaw results; absent for round-trips
   ret_origin?:      string;
   ret_destination?: string;
 }
@@ -97,7 +94,6 @@ export interface TrainCombinationResult {
 }
 
 export interface QueryResultRow {
-  // itineraries columns
   itinerary_id: number;
   session_id: string;
   site: string;
@@ -108,7 +104,6 @@ export interface QueryResultRow {
   pax: number;
   search_url: string | null;
   scraped_at: string;
-  // flight_options columns
   option_id: number;
   airline: string;
   total_price: number;
@@ -137,12 +132,12 @@ export interface TrainItineraryRecord {
 }
 
 export interface TrainOptionRecord {
-  operator:      string;  // e.g. "Renfe", "iryo", "SNCF"
-  total_price:   number;  // total for all passengers
-  out_dep_time:  string;  // "HH:MM"
+  operator:      string;
+  total_price:   number;
+  out_dep_time:  string;
   out_arr_time:  string;
-  out_duration?: string | null; // "2h 40m"
-  out_changes:   number;  // number of changes (not "stops")
+  out_duration?: string | null;
+  out_changes:   number;
   ret_dep_time?: string | null;
   ret_arr_time?: string | null;
   ret_duration?: string | null;
@@ -262,16 +257,6 @@ export class FlightDB {
         UNIQUE(itinerary_id, airline, out_dep_time, ret_dep_time)
       );
 
-      CREATE TABLE IF NOT EXISTS errors (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        site       TEXT,
-        session_id TEXT,
-        tool       TEXT,
-        error      TEXT,
-        context    TEXT,
-        timestamp  DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-
       CREATE INDEX IF NOT EXISTS idx_fo_price    ON flight_options(itinerary_id, total_price);
       CREATE INDEX IF NOT EXISTS idx_fo_dep_time ON flight_options(itinerary_id, out_dep_time);
       CREATE INDEX IF NOT EXISTS idx_fo_stops    ON flight_options(itinerary_id, out_stops);
@@ -312,6 +297,16 @@ export class FlightDB {
       CREATE INDEX IF NOT EXISTS idx_to_price    ON train_options(itinerary_id, total_price);
       CREATE INDEX IF NOT EXISTS idx_to_dep_time ON train_options(itinerary_id, out_dep_time);
       CREATE INDEX IF NOT EXISTS idx_ti_session  ON train_itineraries(session_id, origin, destination);
+
+      CREATE TABLE IF NOT EXISTS errors (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        site       TEXT,
+        session_id TEXT,
+        tool       TEXT,
+        error      TEXT,
+        context    TEXT,
+        timestamp  DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
     `);
   }
 
@@ -395,7 +390,6 @@ export class FlightDB {
       rec.search_url ?? null
     );
 
-    // NOTE: Use `IS ?` not `= ?` — SQLite requires IS for NULL comparison
     const row = this.db.prepare(`
       SELECT id FROM itineraries
       WHERE session_id = ?
@@ -441,8 +435,6 @@ export class FlightDB {
 
   queryFlightOptions(params: FlightQueryParams): QueryResultRow[] {
     const optionsPerItinerary = params.limit ?? 3;
-
-    // Build itinerary ID list — supports single route or multiple legs (open-jaw)
     let itinIds: number[] = [];
 
     const legs = params.legs && params.legs.length > 0
@@ -473,10 +465,7 @@ export class FlightDB {
 
     if (itinIds.length === 0) return [];
 
-    // 2. Top N opciones por itinerario, con filtros de vuelo
-    //    SQLite soporta ROW_NUMBER() desde v3.25 (2018)
     const placeholders = itinIds.map(() => '?').join(',');
-
     const orderCol =
       params.sort_by === 'dep_time' ? 'fo.out_dep_time' :
       params.sort_by === 'stops'    ? 'fo.out_stops'    :
@@ -521,9 +510,7 @@ export class FlightDB {
       ${foFilters}
     `;
 
-    // Envolver en subquery para filtrar por rn
     const wrapped = `SELECT * FROM (${q}) WHERE rn <= ?`;
-
     return this.db.prepare(wrapped).all(...foP) as QueryResultRow[];
   }
 
@@ -535,20 +522,14 @@ export class FlightDB {
     max_days: number;
     top: number;
     session_id: string;
-    // Open-jaw: return leg departs from a different city
-    // If omitted, defaults to round-trip (destination→origin)
     return_origin?:      string;
     return_destination?: string;
   }): CombinationResult[] {
     const rawOutDates = this.queryScouts(params.origin, params.destination, params.months);
-
-    // For open-jaw: use the explicit return route.
-    // For round-trip: default to destination→origin.
     const retOrigin      = params.return_origin      ?? params.destination;
     const retDestination = params.return_destination ?? params.origin;
     const rawRetDates    = this.queryScouts(retOrigin, retDestination, params.months);
 
-    // Deduplicate: keep cheapest price per date
     const dedupe = (rows: FlightScoutRecord[]) => {
       const map = new Map<string, FlightScoutRecord>();
       for (const d of rows) {
@@ -583,7 +564,6 @@ export class FlightDB {
             total_price: out.price + ret.price,
             trip_days:   diffDays,
             session_id:  params.session_id,
-            // Only set for open-jaw (when return route differs from default B→A)
             ...(params.return_origin      ? { ret_origin:      params.return_origin }      : {}),
             ...(params.return_destination ? { ret_destination: params.return_destination } : {})
           });
@@ -620,7 +600,6 @@ export class FlightDB {
     const rawOut = this.queryTrainScouts(params.origin_id, params.destination_id, params.months);
     const rawRet = this.queryTrainScouts(retOriginId, retDestId, params.months);
 
-    // dedupe: keep cheapest price per date
     const dedupe = (rows: TrainScoutRecord[]) => {
       const map = new Map<string, TrainScoutRecord>();
       for (const d of rows) {
@@ -733,7 +712,6 @@ export class FlightDB {
 
   queryTrainOptions(params: TrainQueryParams): TrainQueryResultRow[] {
     const optionsPerItinerary = params.limit ?? 3;
-
     const legs = params.legs && params.legs.length > 0
       ? params.legs
       : params.origin && params.destination
@@ -763,7 +741,6 @@ export class FlightDB {
     if (itinIds.length === 0) return [];
 
     const placeholders = itinIds.map(() => '?').join(',');
-
     const orderCol =
       params.sort_by === 'dep_time' ? 'to_.out_dep_time' :
       params.sort_by === 'changes'  ? 'to_.out_changes'  :

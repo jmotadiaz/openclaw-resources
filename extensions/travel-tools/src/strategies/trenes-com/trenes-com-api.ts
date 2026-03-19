@@ -40,6 +40,9 @@ export async function resolveStation(cityName: string): Promise<StationResult> {
           return;
         }
 
+        // --- Log the raw response body as requested ---
+        logger.info(`[TrenesCom] resolveStation raw response for '${cityName}': ${data}`);
+
         try {
           const response = JSON.parse(data);
           if (response.result !== 'ok') {
@@ -53,18 +56,13 @@ export async function resolveStation(cityName: string): Promise<StationResult> {
             return;
           }
 
-          // Parsing logic from implementation plan:
-          // Priority: find the entry in estaciones where the SAME numeric key
-          // exists in todas with value "1".
-          // Fallback: if no todas["X"] === "1" found, use estaciones["0"] of
-          // the first group whose ciudad matches the query (case-insensitive).
-          // Final fallback: use estaciones["0"] of the very first group.
-
           const groups = Object.values(stationsObj) as any[];
           
-          // 1. Priority: todas["X"] === "1"
           for (const group of groups) {
-            if (group.estaciones && group.todas) {
+            if (!group.estaciones) continue;
+            
+            // 1. Try to match the key from 'todas' where value is "1"
+            if (group.todas) {
               for (const [key, val] of Object.entries(group.todas)) {
                 if (val === "1" && group.estaciones[key]) {
                   resolve({ id: group.estaciones[key], name: group.ciudad });
@@ -72,24 +70,17 @@ export async function resolveStation(cityName: string): Promise<StationResult> {
                 }
               }
             }
-          }
 
-          // 2. Fallback: ciudad matches query
-          for (const group of groups) {
-            if (group.ciudad && group.ciudad.toLowerCase().includes(cityName.toLowerCase()) && group.estaciones && group.estaciones["0"]) {
-              resolve({ id: group.estaciones["0"], name: group.ciudad });
+            // 2. Fallback: If 'todas' matched a key that doesn't exist in 'estaciones' (like "0"),
+            // or if we just want the first station of this group.
+            const firstStationId = Object.values(group.estaciones)[0] as string;
+            if (firstStationId) {
+              resolve({ id: firstStationId, name: group.ciudad });
               return;
             }
           }
 
-          // 3. Final fallback: first group's first station
-          const firstGroup = groups[0];
-          if (firstGroup && firstGroup.estaciones && firstGroup.estaciones["0"]) {
-            resolve({ id: firstGroup.estaciones["0"], name: firstGroup.ciudad });
-            return;
-          }
-
-          reject(new Error('station_not_found (parse fail): ' + cityName));
+          reject(new Error('station_not_found: ' + cityName));
         } catch (e: any) {
           reject(new Error('api_auth_required: response is not JSON — cookies may be needed'));
         }
@@ -113,7 +104,7 @@ export async function fetchMonthlyPrices(origen: string, destino: string, mes: n
     const req = https.request({
       hostname: 'www.trenes.com',
       path,
-      method: 'POST', // All params in query string as per plan
+      method: 'POST',
       headers: {
         'Accept': '*/*',
         'X-Requested-With': 'XMLHttpRequest',
@@ -130,16 +121,17 @@ export async function fetchMonthlyPrices(origen: string, destino: string, mes: n
           return;
         }
 
+        // --- Log the raw response body as requested ---
+        logger.info(`[TrenesCom] fetchMonthlyPrices raw response: ${data}`);
+
         try {
           const response = JSON.parse(data);
 
-          // Response is empty object {} -> return []
           if (Object.keys(response).length === 0) {
             resolve([]);
             return;
           }
 
-          // If response has 'result' key, it's an unexpected format (error or auth)
           if (response.result !== undefined) {
              reject(new Error('getPreciosDia unexpected format: ' + data));
              return;
@@ -147,7 +139,6 @@ export async function fetchMonthlyPrices(origen: string, destino: string, mes: n
 
           const prices: DayPrice[] = [];
           for (const [key, value] of Object.entries(response)) {
-            // key is YYYYMMDD
             if (key.length === 8) {
               const date = `${key.slice(0, 4)}-${key.slice(4, 6)}-${key.slice(6, 8)}`;
               const price = parseFloat(value as string);

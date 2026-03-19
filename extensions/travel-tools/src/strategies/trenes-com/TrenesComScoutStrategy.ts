@@ -4,75 +4,58 @@ import { FlightDB } from '../../utils/db';
 import { logger } from '../../utils/logger';
 
 export class TrenesComScoutStrategy implements TrainScoutStrategy {
-
   async scoutDates(params: TrainScoutParams): Promise<TrainScoutResult> {
     const db = new FlightDB(params.dbPath);
     try {
-      logger.info(`[TrenesCom] scoutDates: ${params.origin_city} → ${params.destination_city} (${params.month})`);
+      logger.info(`[TrenesCom] Resolving stations: ${params.origin_city} -> ${params.destination_city}`);
+      
+      const [origin, destination] = await Promise.all([
+        resolveStation(params.origin_city),
+        resolveStation(params.destination_city)
+      ]);
 
-      // 1. Resolve station IDs
-      const originStation      = await resolveStation(params.origin_city);
-      const destinationStation = await resolveStation(params.destination_city);
+      logger.info(`[TrenesCom] Resolved: ${origin.name} (${origin.id}) -> ${destination.name} (${destination.id})`);
 
-      logger.info(`[TrenesCom] Resolved: ${originStation.name} (${originStation.id}) → ${destinationStation.name} (${destinationStation.id})`);
-
-      // 2. Parse month
       const [yearStr, monthStr] = params.month.split('-');
-      const ano = parseInt(yearStr, 10);
-      const mes = parseInt(monthStr, 10);
+      const year  = parseInt(yearStr);
+      const month = parseInt(monthStr);
 
-      // 3. Fetch prices
-      const prices = await fetchMonthlyPrices(
-        originStation.id,
-        destinationStation.id,
-        mes,
-        ano
-      );
+      logger.info(`[TrenesCom] Fetching prices for ${params.month}`);
+      const prices = await fetchMonthlyPrices(origin.id, destination.id, month, year);
 
       if (prices.length === 0) {
         return {
-          status:  'error',
-          reason:  `no_prices_found: no train prices available for ${params.origin_city}→${params.destination_city} in ${params.month}`,
-          origin_id:      originStation.id,
-          destination_id: destinationStation.id
+          status: 'success',
+          cheapest_dates: [],
+          message: `No prices found for ${params.month}`
         };
       }
 
-      // 4. Persist to train_scouts
-      for (const { date, price } of prices) {
+      // Persist to DB
+      for (const p of prices) {
         db.insertTrainScout({
           session_id:       params.session_id,
           site:             'trenes_com',
           origin_city:      params.origin_city,
-          origin_id:        originStation.id,
+          origin_id:        origin.id,
           destination_city: params.destination_city,
-          destination_id:   destinationStation.id,
+          destination_id:   destination.id,
           month:            params.month,
-          date,
-          price
+          date:             p.date,
+          price:            p.price
         });
       }
 
-      // 5. Return top 5 cheapest for summary
-      const cheapest = [...prices]
-        .sort((a, b) => a.price - b.price)
-        .slice(0, 5);
-
-      logger.info(`[TrenesCom] Saved ${prices.length} dates for ${params.origin_city}→${params.destination_city}`);
+      const sorted = [...prices].sort((a, b) => a.price - b.price);
+      const top5 = sorted.slice(0, 5);
 
       return {
-        status:          'success',
-        summary:         `trenes.com: ${prices.length} dates saved for ${params.origin_city}→${params.destination_city} in ${params.month}`,
-        dates_found:     prices.length,
-        cheapest_dates:  cheapest,
-        origin_id:       originStation.id,
-        destination_id:  destinationStation.id
+        status: 'success',
+        cheapest_dates: top5.map(d => ({ date: d.date, price: d.price }))
       };
-
-    } catch (e: any) {
-      logger.error(`[TrenesCom] scoutDates error: ${e.message}`);
-      db.logError('trenes_com', params.session_id, 'scoutDates', e.message);
-      return { status: 'error', reason: e.message };
+    } catch (error: any) {
+      logger.error(`[TrenesCom] scoutDates error: ${error.message}`);
+      throw error;
     } finally {
       db.close();
     }

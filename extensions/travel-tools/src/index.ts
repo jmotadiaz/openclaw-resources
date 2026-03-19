@@ -1,4 +1,3 @@
-// extensions/flight-tools/src/index.ts
 import { SkyscannerStrategy } from './strategies/skyscanner/SkyscannerStrategy';
 import { KayakFlightStrategy } from './strategies/kayak/KayakFlightStrategy';
 import { KayakTrainStrategy }  from './strategies/kayak/KayakTrainStrategy';
@@ -7,10 +6,10 @@ import { resolveStation }         from './strategies/trenes-com/trenes-com-api';
 import { resolve } from 'path';
 import { FlightDB } from './utils/db';
 
-const DB_PATH = resolve(__dirname, '..', 'travel.sqlite');
+const DB_PATH = resolve(__dirname, '../travel.sqlite');
+const TASK_TIMEOUT_MS = 60_000 * 5; // 5 minutes
 
-export default function (api: any) {
-  const config = api.config || {};
+export function register(api: any, config: any = {}) {
   const dbPath = config.dbPath || DB_PATH;
 
   // ─── Strategy registries ──────────────────────────────────────────────────
@@ -21,38 +20,21 @@ export default function (api: any) {
 
   const flightStrategies = [
     { name: 'skyscanner', strategy: skyscanner  },
-    { name: 'kayak',      strategy: kayakFlight },
+    { name: 'kayak',       strategy: kayakFlight }
   ];
 
   const trainStrategies = [
-    { name: 'kayak_train', strategy: kayakTrain },
+    { name: 'kayak', strategy: kayakTrain }
   ];
-
-  // ─── Helpers ──────────────────────────────────────────────────────────────
-
-  function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`Timeout after ${ms}ms: ${label}`)),
-        ms
-      );
-      promise.then(
-        val => { clearTimeout(timer); resolve(val); },
-        err => { clearTimeout(timer); reject(err);  }
-      );
-    });
-  }
-
-  const TASK_TIMEOUT_MS = 3 * 60 * 1_000; // 3 minutes
 
   // ─────────────────────────────────────────────────────────────────────────
   // TOOL: date_scout
   // ─────────────────────────────────────────────────────────────────────────
   api.registerTool({
     name: 'date_scout',
-    description: `Scouts cheapest dates for one or more route/month combinations.
-Only Skyscanner is used for the scout phase; Kayak returns a no-op.
-All combinations run concurrently. Partial results are returned on failures.`,
+    description: `Scouts cheapest flight dates for one or more route/month combinations
+across all available strategies. All combinations run concurrently.
+Results are stored in the DB and queryable via find_best_date_combinations.`,
     parameters: {
       type: 'object',
       properties: {
@@ -65,7 +47,7 @@ All combinations run concurrently. Partial results are returned on failures.`,
             properties: {
               origin:      { type: 'string', description: 'Lowercase IATA code' },
               destination: { type: 'string', description: 'Lowercase IATA code' },
-              month:       { type: 'string', description: 'YYYY-MM format' }
+              month:        { type: 'string', description: 'YYYY-MM format' }
             },
             required: ['origin', 'destination', 'month']
           }
@@ -74,35 +56,32 @@ All combinations run concurrently. Partial results are returned on failures.`,
       required: ['session_id', 'routes']
     },
     async execute(_id: string, params: any) {
-      const tasks = params.routes.flatMap((r: any) =>
-        [{ name: 'skyscanner', strategy: skyscanner }].map(s => ({
-          label:   `${s.name}:${r.origin}->${r.destination}:${r.month}`,
-          site:    s.name,
-          route:   `${r.origin}->${r.destination}`,
-          month:   r.month,
-          promise: withTimeout(
-            s.strategy.scoutDates({
-              origin:      r.origin,
-              destination: r.destination,
-              month:       r.month,
-              session_id:  params.session_id,
-              dbPath
-            }),
-            TASK_TIMEOUT_MS,
-            `date_scout ${s.name} ${r.origin}->${r.destination} ${r.month}`
-          )
-        }))
-      );
+      const tasks = params.routes.map((r: any) => ({
+        label:   `skyscanner:${r.origin}->${r.destination}:${r.month}`,
+        route:   `${r.origin}->${r.destination}`,
+        month:   r.month,
+        promise: withTimeout(
+          skyscanner.scoutDates({
+            origin:      r.origin,
+            destination: r.destination,
+            month:       r.month,
+            session_id:  params.session_id,
+            dbPath
+          }),
+          TASK_TIMEOUT_MS,
+          `date_scout skyscanner ${r.origin}->${r.destination} ${r.month}`
+        )
+      }));
 
       const settled = await Promise.allSettled(tasks.map((t: any) => t.promise));
 
       const results = settled.map((outcome, i) => {
         const task = tasks[i];
         if (outcome.status === 'fulfilled') {
-          return { site: task.site, route: task.route, month: task.month, ...outcome.value };
+          return { site: 'skyscanner', route: task.route, month: task.month, ...outcome.value };
         }
         return {
-          site: task.site, route: task.route, month: task.month,
+          site: 'skyscanner', route: task.route, month: task.month,
           status: 'error', reason: outcome.reason?.message ?? String(outcome.reason)
         };
       });
@@ -476,187 +455,33 @@ City names must match exactly what was passed to train_scout.`,
     description: `Retrieves verified flight options from the DB. Never triggers scraping.
 
 CALL ONCE per session — returns all scraped combos grouped by site.
-Do NOT call multiple times for the same session/dates.
-
-Response shape:
-  by_site: {
-    skyscanner: [{ itinerary, flight_options[] }],
-    kayak:      [{ itinerary, flight_options[] }]
-  }
-
-Sites: 'skyscanner' | 'kayak'.
-Pass site= to restrict to one source. Omit to get both.
-
-Trip type:
-- One-way / round-trip: pass origin + destination
-- Open-jaw:             pass legs[] (omit origin & destination)`,
+Do NOT call multiple times for the same session/dates.`,
     parameters: {
       type: 'object',
       properties: {
-        origin:           { type: 'string', description: 'Lowercase IATA code' },
-        destination:      { type: 'string', description: 'Lowercase IATA code' },
-        session_id:       { type: 'string' },
-        site: {
-          type: 'string',
-          description: "Filter by site: 'skyscanner' | 'kayak'. Omit for all."
-        },
-        out_date:         { type: 'string' },
-        ret_date:         { type: 'string' },
-        min_price:        { type: 'number' },
-        max_price:        { type: 'number' },
-        max_stops:        { type: 'number', description: '0 = direct only' },
-        dep_from:         { type: 'string', description: 'HH:MM earliest departure' },
-        dep_until:        { type: 'string', description: 'HH:MM latest departure' },
-        arr_until:        { type: 'string', description: 'HH:MM latest arrival' },
-        airlines:         { type: 'array', items: { type: 'string' } },
-        exclude_airlines: { type: 'array', items: { type: 'string' } },
-        sort_by:          { type: 'string', enum: ['price', 'dep_time', 'stops'], default: 'price' },
-        sort_dir:         { type: 'string', enum: ['asc', 'desc'],               default: 'asc'   },
-        limit: {
-          type: 'number',
-          description: 'Max options PER SITE, sorted by sort_by (default 2).'
-        },
-        legs: {
-          type: 'array',
-          description: 'Open-jaw: list of origin/destination pairs.',
-          items: {
-            type: 'object',
-            properties: {
-              origin:      { type: 'string' },
-              destination: { type: 'string' }
-            },
-            required: ['origin', 'destination']
-          }
-        }
+        session_id:  { type: 'string' },
+        origin:      { type: 'string', description: 'Lowercase IATA code' },
+        destination: { type: 'string', description: 'Lowercase IATA code' },
+        limit:       { type: 'number', description: 'Max options PER itinerary' },
+        sort_by:     { type: 'string', enum: ['price', 'dep_time', 'stops'] },
+        sort_dir:    { type: 'string', enum: ['asc', 'desc'] }
       },
       required: ['session_id']
     },
     async execute(_id: string, params: any) {
-      const hasRoute = params.origin && params.destination;
-      const hasLegs  = params.legs && params.legs.length > 0;
-      if (!hasRoute && !hasLegs) {
-        return {
-          status: 'error',
-          message: 'Provide either origin + destination or legs[] for open-jaw.'
-        };
-      }
-
       const db = new FlightDB(dbPath);
       try {
-        const sitesToQuery: string[] = params.site
-          ? [params.site]
-          : ['skyscanner', 'kayak'];
-
-        const limitPerSite = params.limit ?? 2;
-
-        const commonQueryParams = {
-          session_id:       params.session_id,
-          ...(params.origin      ? { origin:      params.origin }      : {}),
-          ...(params.destination ? { destination: params.destination } : {}),
-          legs:             params.legs,
-          out_date:         params.out_date,
-          ret_date:         params.ret_date,
-          min_price:        params.min_price,
-          max_price:        params.max_price,
-          max_stops:        params.max_stops,
-          dep_from:         params.dep_from,
-          dep_until:        params.dep_until,
-          arr_until:        params.arr_until,
-          airlines:         params.airlines,
-          exclude_airlines: params.exclude_airlines,
-          sort_by:          (params.sort_by  ?? 'price') as any,
-          sort_dir:         (params.sort_dir ?? 'asc')   as any,
-          limit:            limitPerSite
-        };
-
-        const bySite: Record<string, { itinerary: object; flight_options: object[] }[]> = {};
-        let totalOptions = 0;
-
-        for (const site of sitesToQuery) {
-          const rows = db.queryFlightOptions({ ...commonQueryParams, site });
-          if (rows.length === 0) continue;
-
-          totalOptions += rows.length;
-
-          const siteGrouped = new Map<number, { itinerary: object; flight_options: object[] }>();
-
-          for (const r of rows) {
-            let group = siteGrouped.get(r.itinerary_id);
-            if (!group) {
-              group = {
-                itinerary: {
-                  id:          r.itinerary_id,
-                  site:        r.site,
-                  origin:      r.origin.toUpperCase(),
-                  destination: r.destination.toUpperCase(),
-                  out_date:    r.out_date,
-                  ret_date:    r.ret_date ?? null,
-                  pax:         r.pax,
-                  search_url:  r.search_url,
-                  scraped_at:  r.scraped_at
-                },
-                flight_options: []
-              };
-              siteGrouped.set(r.itinerary_id, group);
-            }
-
-            const option: any = {
-              airline:     r.airline,
-              total_price: r.total_price,
-              outbound: {
-                dep:      r.out_dep_time,
-                arr:      r.out_arr_time,
-                duration: r.out_duration ?? null,
-                stops:    r.out_stops
-              }
-            };
-
-            if (r.ret_dep_time) {
-              option.return_leg = {
-                dep:      r.ret_dep_time,
-                arr:      r.ret_arr_time  ?? null,
-                duration: r.ret_duration ?? null,
-                stops:    r.ret_stops    ?? null
-              };
-            }
-
-            group.flight_options.push(option);
-          }
-
-          bySite[site] = Array.from(siteGrouped.values());
-        }
-
-        if (totalOptions === 0) {
-          return {
-            status: 'empty',
-            message: 'No options found for the given filters. Try relaxing constraints.'
-          };
-        }
-
-        // Open-jaw combo totals per site
-        const comboTotals: Record<string, number> = {};
-        if (params.legs && params.legs.length > 1) {
-          for (const [site, groups] of Object.entries(bySite)) {
-            if (groups.length > 1) {
-              comboTotals[site] = groups.reduce((sum, g) => {
-                const opts = g.flight_options as any[];
-                return sum + (opts.length > 0 ? opts[0].total_price : 0);
-              }, 0);
-            }
-          }
-        }
-
-        return {
-          status:         'success',
-          total_options:  totalOptions,
-          limit_per_site: limitPerSite,
-          by_site: bySite,
-          itineraries: Object.values(bySite).flat(),
-          ...(Object.keys(comboTotals).length > 0 ? { combo_totals: comboTotals } : {})
-        };
-
-      } catch (e: any) {
-        return { status: 'error', message: e.message };
+        const results = db.queryFlightOptions({
+          session_id:  params.session_id,
+          origin:      params.origin,
+          destination: params.destination,
+          limit:       params.limit   || 3,
+          sort_by:     params.sort_by || 'price',
+          sort_dir:    params.sort_dir || 'asc'
+        });
+        return { status: 'success', data: results };
+      } catch (error: any) {
+        return { status: 'error', reason: 'consolidation_failed', message: error.message };
       } finally {
         db.close();
       }
@@ -668,159 +493,46 @@ Trip type:
   // ─────────────────────────────────────────────────────────────────────────
   api.registerTool({
     name: 'consolidate_final_train_report',
-    description: `Retrieves verified train options from the DB. Never triggers scraping.
-Call ONCE per session — returns all scraped combos grouped by site.
-
-Response shape: { by_site: { kayak_train: [{ itinerary, train_options[] }] } }
-
-Sites: 'kayak_train'.
-Pass site= to restrict. Omit to get all.
-
-Trip type:
-- One-way / round-trip: pass origin + destination
-- Open-jaw:             pass legs[] (omit origin & destination)`,
+    description: `Retrieves verified train options from the DB.`,
     parameters: {
       type: 'object',
       properties: {
-        origin:      { type: 'string', description: 'Lowercase IATA code' },
-        destination: { type: 'string', description: 'Lowercase IATA code' },
         session_id:  { type: 'string' },
-        site:        { type: 'string', description: "Filter by site: 'kayak_train'. Omit for all." },
-        out_date:    { type: 'string' },
-        ret_date:    { type: 'string' },
-        min_price:   { type: 'number' },
-        max_price:   { type: 'number' },
-        max_changes: { type: 'number', description: '0 = direct only' },
-        sort_by:     { type: 'string', enum: ['price', 'dep_time', 'changes'], default: 'price' },
-        sort_dir:    { type: 'string', enum: ['asc', 'desc'],                   default: 'asc'   },
-        limit: {
-          type: 'number',
-          description: 'Max options PER SITE, sorted by sort_by (default 2).'
-        },
-        legs: {
-          type: 'array',
-          description: 'Open-jaw: list of origin/destination pairs.',
-          items: {
-            type: 'object',
-            properties: {
-              origin:      { type: 'string' },
-              destination: { type: 'string' }
-            },
-            required: ['origin', 'destination']
-          }
-        }
+        origin:      { type: 'string' },
+        destination: { type: 'string' },
+        limit:       { type: 'number' },
+        sort_by:     { type: 'string', enum: ['price', 'dep_time', 'changes'] },
+        sort_dir:    { type: 'string', enum: ['asc', 'desc'] }
       },
       required: ['session_id']
     },
     async execute(_id: string, params: any) {
-      const hasRoute = params.origin && params.destination;
-      const hasLegs  = params.legs && params.legs.length > 0;
-      if (!hasRoute && !hasLegs) {
-        return {
-          status: 'error',
-          message: 'Provide either origin + destination or legs[] for open-jaw.'
-        };
-      }
-
       const db = new FlightDB(dbPath);
       try {
-        const sitesToQuery: string[] = params.site
-          ? [params.site]
-          : ['kayak_train'];
-
-        const limitPerSite = params.limit ?? 2;
-
-        const commonQueryParams = {
+        const results = db.queryTrainOptions({
           session_id:  params.session_id,
-          ...(params.origin      ? { origin:      params.origin }      : {}),
-          ...(params.destination ? { destination: params.destination } : {}),
-          legs:        params.legs,
-          out_date:    params.out_date,
-          ret_date:    params.ret_date,
-          min_price:   params.min_price,
-          max_price:   params.max_price,
-          max_changes: params.max_changes,
-          sort_by:     (params.sort_by  ?? 'price') as any,
-          sort_dir:    (params.sort_dir ?? 'asc')   as any,
-          limit:       limitPerSite
-        };
-
-        const bySite: Record<string, { itinerary: object; train_options: object[] }[]> = {};
-        let totalOptions = 0;
-
-        for (const site of sitesToQuery) {
-          const rows = db.queryTrainOptions({ ...commonQueryParams, site });
-          if (rows.length === 0) continue;
-
-          totalOptions += rows.length;
-
-          const siteGrouped = new Map<number, { itinerary: object; train_options: object[] }>();
-
-          for (const r of rows) {
-            let group = siteGrouped.get(r.itinerary_id);
-            if (!group) {
-              group = {
-                itinerary: {
-                  id:          r.itinerary_id,
-                  site:        r.site,
-                  origin:      r.origin.toUpperCase(),
-                  destination: r.destination.toUpperCase(),
-                  out_date:    r.out_date,
-                  ret_date:    r.ret_date ?? null,
-                  adults:      r.adults,
-                  search_url:  r.search_url,
-                  scraped_at:  r.scraped_at
-                },
-                train_options: []
-              };
-              siteGrouped.set(r.itinerary_id, group);
-            }
-
-            const option: any = {
-              operator:    r.operator,
-              total_price: r.total_price,
-              outbound: {
-                dep:      r.out_dep_time,
-                arr:      r.out_arr_time,
-                duration: r.out_duration ?? null,
-                changes:  r.out_changes
-              }
-            };
-
-            if (r.ret_dep_time) {
-              option.return_leg = {
-                dep:      r.ret_dep_time,
-                arr:      r.ret_arr_time  ?? null,
-                duration: r.ret_duration ?? null,
-                changes:  r.ret_changes  ?? null
-              };
-            }
-
-            group.train_options.push(option);
-          }
-
-          bySite[site] = Array.from(siteGrouped.values());
-        }
-
-        if (totalOptions === 0) {
-          return {
-            status: 'empty',
-            message: 'No train options found for the given filters. Try relaxing constraints.'
-          };
-        }
-
-        return {
-          status:         'success',
-          total_options:  totalOptions,
-          limit_per_site: limitPerSite,
-          by_site: bySite
-        };
-
-      } catch (e: any) {
-        return { status: 'error', message: e.message };
+          origin:      params.origin,
+          destination: params.destination,
+          limit:       params.limit   || 3,
+          sort_by:     params.sort_by || 'price',
+          sort_dir:    params.sort_dir || 'asc'
+        });
+        return { status: 'success', data: results };
+      } catch (error: any) {
+        return { status: 'error', reason: 'consolidation_failed', message: error.message };
       } finally {
         db.close();
       }
     }
   });
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timeoutId: any;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`TASK_TIMEOUT: ${label} (exceeded ${ms}ms)`));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
