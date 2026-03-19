@@ -207,12 +207,6 @@
       "nodeManager": "npm"
     },
     "entries": {
-      "skyscanner-search": {
-        "enabled": true
-      },
-      "skyscanner-dates": {
-        "enabled": true
-      },
       "mcporter": {
         "enabled": true
       },
