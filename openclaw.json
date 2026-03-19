@@ -108,9 +108,11 @@
             "read",
             "write",
             "date_scout",
+            "train_scout",
             "flight_scraper",
             "train_scraper",
             "find_best_date_combinations",
+            "find_best_train_date_combinations",
             "consolidate_final_flight_report",
             "consolidate_final_train_report",
             "group:sessions"
@@ -210,7 +212,10 @@
       "mcporter": {
         "enabled": true
       },
-      "travel-orchestrator": {
+      "travel-flight-orchestrator": {
+        "enabled": true
+      },
+      "travel-train-orchestrator": {
         "enabled": true
       }
     }

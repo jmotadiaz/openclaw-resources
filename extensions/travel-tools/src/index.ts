@@ -2,6 +2,8 @@
 import { SkyscannerStrategy } from './strategies/skyscanner/SkyscannerStrategy';
 import { KayakFlightStrategy } from './strategies/kayak/KayakFlightStrategy';
 import { KayakTrainStrategy }  from './strategies/kayak/KayakTrainStrategy';
+import { TrenesComScoutStrategy } from './strategies/trenes-com/TrenesComScoutStrategy';
+import { resolveStation }         from './strategies/trenes-com/trenes-com-api';
 import { resolve } from 'path';
 import { FlightDB } from './utils/db';
 
@@ -12,9 +14,10 @@ export default function (api: any) {
   const dbPath = config.dbPath || DB_PATH;
 
   // ─── Strategy registries ──────────────────────────────────────────────────
-  const skyscanner  = new SkyscannerStrategy();
-  const kayakFlight = new KayakFlightStrategy();
-  const kayakTrain  = new KayakTrainStrategy();
+  const skyscanner     = new SkyscannerStrategy();
+  const kayakFlight    = new KayakFlightStrategy();
+  const kayakTrain     = new KayakTrainStrategy();
+  const trenesComScout = new TrenesComScoutStrategy();
 
   const flightStrategies = [
     { name: 'skyscanner', strategy: skyscanner  },
@@ -100,6 +103,78 @@ All combinations run concurrently. Partial results are returned on failures.`,
         }
         return {
           site: task.site, route: task.route, month: task.month,
+          status: 'error', reason: outcome.reason?.message ?? String(outcome.reason)
+        };
+      });
+
+      const allSuccess = results.every(r => r.status === 'success');
+      const anyError   = results.some(r  => r.status === 'error');
+
+      return {
+        status: allSuccess ? 'success' : anyError ? 'partial' : 'success',
+        results
+      };
+    }
+  }, { optional: true });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // TOOL: train_scout
+  // ─────────────────────────────────────────────────────────────────────────
+  api.registerTool({
+    name: 'train_scout',
+    description: `Scouts cheapest train dates for one or more route/month combinations
+using trenes.com API (no browser required — pure HTTP).
+Accepts city names in Spanish (e.g. "Madrid", "Sevilla").
+Station IDs are resolved automatically via getEstaciones API.
+All combinations run concurrently. Partial results returned on failures.
+Results stored in train_scouts table, queryable via find_best_train_date_combinations.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'Orchestrator session ID' },
+        routes: {
+          type: 'array',
+          description: 'Route + month combinations to scout.',
+          items: {
+            type: 'object',
+            properties: {
+              origin_city:      { type: 'string', description: 'City name in Spanish, e.g. "Madrid"' },
+              destination_city: { type: 'string', description: 'City name in Spanish, e.g. "Sevilla"' },
+              month:            { type: 'string', description: 'YYYY-MM format' }
+            },
+            required: ['origin_city', 'destination_city', 'month']
+          }
+        }
+      },
+      required: ['session_id', 'routes']
+    },
+    async execute(_id: string, params: any) {
+      const tasks = params.routes.map((r: any) => ({
+        label:   `trenes_com:${r.origin_city}->${r.destination_city}:${r.month}`,
+        route:   `${r.origin_city}->${r.destination_city}`,
+        month:   r.month,
+        promise: withTimeout(
+          trenesComScout.scoutDates({
+            origin_city:      r.origin_city,
+            destination_city: r.destination_city,
+            month:            r.month,
+            session_id:       params.session_id,
+            dbPath
+          }),
+          TASK_TIMEOUT_MS,
+          `train_scout trenes_com ${r.origin_city}->${r.destination_city} ${r.month}`
+        )
+      }));
+
+      const settled = await Promise.allSettled(tasks.map((t: any) => t.promise));
+
+      const results = settled.map((outcome, i) => {
+        const task = tasks[i];
+        if (outcome.status === 'fulfilled') {
+          return { site: 'trenes_com', route: task.route, month: task.month, ...outcome.value };
+        }
+        return {
+          site: 'trenes_com', route: task.route, month: task.month,
           status: 'error', reason: outcome.reason?.message ?? String(outcome.reason)
         };
       });
@@ -315,6 +390,75 @@ Results are stored in a separate DB table from flights.`,
           return_origin:      params.return_origin,
           return_destination: params.return_destination
         });
+        return { status: 'success', data: results };
+      } catch (error: any) {
+        return { status: 'error', reason: 'extraction_failed', message: error.message };
+      } finally {
+        db.close();
+      }
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // TOOL: find_best_train_date_combinations
+  // ─────────────────────────────────────────────────────────────────────────
+  api.registerTool({
+    name: 'find_best_train_date_combinations',
+    description: `Analyzes train scouting data (trenes.com) and returns the best date windows.
+Requires train_scout to have run first for the given session and routes.
+City names must match exactly what was passed to train_scout.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        session_id:             { type: 'string' },
+        origin_city:            { type: 'string', description: 'Same city name used in train_scout' },
+        destination_city:       { type: 'string', description: 'Same city name used in train_scout' },
+        months:                 { type: 'string', description: 'Comma-separated YYYY-MM months' },
+        min_days:               { type: 'number' },
+        max_days:               { type: 'number' },
+        top:                    { type: 'number', description: 'Max combinations to return (default 5)' },
+        return_origin_city:      { type: 'string', description: 'Open-jaw only' },
+        return_destination_city: { type: 'string', description: 'Open-jaw only' }
+      },
+      required: ['session_id', 'origin_city', 'destination_city']
+    },
+    async execute(_id: string, params: any) {
+      const db = new FlightDB(dbPath);
+      try {
+        const months = params.months
+          ? params.months.split(',').map((m: string) => m.trim())
+          : [];
+
+        // Resolve station IDs from city names (needed for DB lookup)
+        const originStation      = await resolveStation(params.origin_city);
+        const destinationStation = await resolveStation(params.destination_city);
+
+        let retOriginStation      = { id: destinationStation.id, name: destinationStation.name };
+        let retDestinationStation = { id: originStation.id,      name: originStation.name };
+
+        if (params.return_origin_city) {
+          retOriginStation = await resolveStation(params.return_origin_city);
+        }
+        if (params.return_destination_city) {
+          retDestinationStation = await resolveStation(params.return_destination_city);
+        }
+
+        const results = db.extractTrainDateCombinations({
+          origin_id:              originStation.id,
+          destination_id:         destinationStation.id,
+          origin_city:            params.origin_city,
+          destination_city:       params.destination_city,
+          months,
+          min_days:               params.min_days   ?? 2,
+          max_days:               params.max_days   ?? 14,
+          top:                    params.top        ?? 5,
+          session_id:             params.session_id,
+          return_origin_id:       params.return_origin_city      ? retOriginStation.id      : undefined,
+          return_destination_id:  params.return_destination_city ? retDestinationStation.id : undefined,
+          return_origin_city:     params.return_origin_city,
+          return_destination_city: params.return_destination_city
+        });
+
         return { status: 'success', data: results };
       } catch (error: any) {
         return { status: 'error', reason: 'extraction_failed', message: error.message };

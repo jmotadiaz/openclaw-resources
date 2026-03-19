@@ -1,6 +1,6 @@
 ---
-name: travel-orchestrator
-description: Orchestrates a travel plan by scouting dates, searching flights (and optionally trains), and consolidating results from Skyscanner + Kayak.
+name: travel-flight-orchestrator
+description: Orchestrates a flight-only travel plan by scouting dates, searching flights across Skyscanner + Kayak, and consolidating results. For trains, use travel-train-orchestrator.
 ---
 
 ## Workflow
@@ -32,7 +32,6 @@ Return:    SVQ → MAD
 Months:    2026-07
 Min days:  2 | Max days: 5
 Pax:       2
-Include trains: true
 
 Checklist:
 [x] Session Init
@@ -41,7 +40,6 @@ Checklist:
 [ ] Extractor Phase (find_best_date_combinations)
 [ ] Search Checklist (appended after Phase 2)
 [ ] Scraping Flights
-[ ] Scraping Trains                     ← only if include_trains: true
 [ ] Final Report
 ```
 
@@ -81,17 +79,19 @@ Call `find_best_date_combinations`:
 ```
 find_best_date_combinations(
   session_id:  "{session_id}",
-  outbound:    { origin: "mad", destination: "svq" },
-  return:      { origin: "svq", destination: "mad" },   ← omit for one-way
+  origin:      "mad",
+  destination: "svq",
   min_days:    2,
   max_days:    5,
-  top_n:       3
+  top:         3,
+  months:      "2026-07"
 )
 ```
 
-> For **one-way** trips, omit the `return` parameter entirely.
+> For **one-way** trips, omit the `return` parameters if the tool supports them (but currently it uses scouts in DB).
+> The tool returns a list of date combinations sorted by estimated price. 
 
-The tool returns a list of date combinations sorted by estimated price. Append the **Search Checklist** to `plan.md` using the format that matches the trip type:
+Append the **Search Checklist** to `plan.md` using the format that matches the trip type:
 
 **Round-trip example** (one entry per combo):
 ```
@@ -116,16 +116,15 @@ Search Checklist:
 
 ### Phase 3 — Scraping (parallel)
 
-#### 3a — Flight Scraping (Skyscanner + Kayak Flights)
+#### Flight Scraping (Skyscanner + Kayak Flights)
 
-> ⚠️ **`flight_scraper` does not accept `include_trains`.** Internally it spawns 2 concurrent browsers per combination (Skyscanner + Kayak flights).
+Internally it spawns 2 concurrent browsers per combination (Skyscanner + Kayak flights).
 
 **Round-trip example:**
 ```
 flight_scraper(
   session_id:   "{session_id}",
   pax:          2,
-  children:     [],
   combinations: [
     { origin: "mad", destination: "svq", exact_date: "2026-07-19", return_date: "2026-07-22" },
     { origin: "mad", destination: "svq", exact_date: "2026-07-03", return_date: "2026-07-06" }
@@ -138,7 +137,6 @@ flight_scraper(
 flight_scraper(
   session_id:   "{session_id}",
   pax:          2,
-  children:     [],
   combinations: [
     { origin: "mad", destination: "svq", exact_date: "2026-07-19" },
     { origin: "svq", destination: "bcn", exact_date: "2026-07-22" }
@@ -147,40 +145,6 @@ flight_scraper(
 ```
 
 **CAPTCHA handling:** if Kayak returns 0 results, mark `[!] FAILED: CAPTCHA` on the corresponding checkbox and report to the user. Do not retry.
-
-#### 3b — Train Scraping (only if `include_trains: true`)
-
-> ⚠️ Only execute this phase if the user explicitly requested trains.
-
-Call `train_scraper` with the **same combinations** as `flight_scraper`:
-
-**Round-trip example:**
-```
-train_scraper(
-  session_id:   "{session_id}",
-  adults:       2,
-  children:     [],
-  combinations: [
-    { origin: "mad", destination: "svq", exact_date: "2026-07-19", return_date: "2026-07-22" },
-    { origin: "mad", destination: "svq", exact_date: "2026-07-03", return_date: "2026-07-06" }
-  ]
-)
-```
-
-**Open-jaw example** (same logic as flights: one leg per entry, no `return_date`):
-```
-train_scraper(
-  session_id:   "{session_id}",
-  adults:       2,
-  children:     [],
-  combinations: [
-    { origin: "mad", destination: "svq", exact_date: "2026-07-19" },
-    { origin: "svq", destination: "bcn", exact_date: "2026-07-22" }
-  ]
-)
-```
-
-**CAPTCHA handling:** same behaviour as 3a. Mark `[!] FAILED: CAPTCHA` and report without retrying.
 
 **🛑 Do not advance to Phase 4 until all Scraping checkboxes are `[x]` or `[!] FAILED`.**
 
@@ -214,22 +178,7 @@ consolidate_final_flight_report(
 )
 ```
 
-#### 4b — Consolidate Trains (only if `include_trains: true`)
-
-Call `consolidate_final_train_report` **exactly once**:
-
-**example:**
-```
-consolidate_final_train_report(
-  origin:      "mad",
-  destination: "svq",
-  session_id:  "{session_id}",
-  limit:       2,
-  sort_by:     "price"
-)
-```
-
-#### 4c — Write the Report
+#### 4b — Write the Report
 
 1. Write the full report to `report.md` using the `write` tool with the format for the matching scenario (see section below).
 2. Mark `[x] Final Report` in `plan.md`.
@@ -241,7 +190,6 @@ consolidate_final_train_report(
 > **Best option per site:**
 > - 🟠 Skyscanner: [Option N] [dates] — €[price] ([search_url])
 > - 🔵 Kayak flights: [Option N] [dates] — €[price] ([search_url])
-> - 🚄 Kayak trains: [Option N] [dates] — €[price] ([search_url])   ← only if trains available
 ```
 
 ---
@@ -298,19 +246,7 @@ consolidate_final_train_report(
 | 2 | DEP–ARR | DEP–ARR | €PRICE | AIRLINE |
 
 🔗 [View on Kayak](SEARCH_URL)
-
----
-
-#### 🚄 Kayak — Trains
-| # | Outbound | Return | Total ([PAX] pax) | Operator | Changes |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| 1 | DEP–ARR | DEP–ARR | €PRICE | OPERATOR | 0 |
-| 2 | DEP–ARR | DEP–ARR | €PRICE | OPERATOR | 0 |
-
-🔗 [View trains on Kayak](SEARCH_URL)
 ```
-
-> Omit the **🚄 Kayak — Trains** section entirely if `train_scraper` was not called or returned no results.
 
 ---
 

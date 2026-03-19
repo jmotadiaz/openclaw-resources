@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 
-export interface ScoutRecord {
+export interface FlightScoutRecord {
   session_id: string;
   site: string;
   origin: string;
@@ -8,6 +8,18 @@ export interface ScoutRecord {
   month: string;
   date: string;
   price: number;
+}
+
+export interface TrainScoutRecord {
+  session_id:       string;
+  site:             string;   // 'trenes_com'
+  origin_city:      string;
+  origin_id:        string;
+  destination_city: string;
+  destination_id:   string;
+  month:            string;   // 'YYYY-MM'
+  date:             string;   // 'YYYY-MM-DD'
+  price:            number;
 }
 
 export interface ItineraryRecord {
@@ -68,6 +80,20 @@ export interface CombinationResult {
   // Populated for open-jaw results; absent for round-trips
   ret_origin?:      string;
   ret_destination?: string;
+}
+
+export interface TrainCombinationResult {
+  out_date:         string;
+  ret_date?:        string;
+  out_price:        number;
+  ret_price?:       number;
+  total_price:      number;
+  trip_days?:       number;
+  session_id:       string;
+  origin_city:      string;
+  destination_city: string;
+  ret_origin_city?:      string;
+  ret_destination_city?: string;
 }
 
 export interface QueryResultRow {
@@ -175,7 +201,7 @@ export class FlightDB {
 
   private initDB(): void {
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS scouts (
+      CREATE TABLE IF NOT EXISTS flight_scouts (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id  TEXT NOT NULL,
         site        TEXT NOT NULL,
@@ -187,6 +213,24 @@ export class FlightDB {
         timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(site, origin, destination, date, session_id)
       );
+
+      CREATE TABLE IF NOT EXISTS train_scouts (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id       TEXT NOT NULL,
+        site             TEXT NOT NULL,
+        origin_city      TEXT NOT NULL,
+        origin_id        TEXT NOT NULL,
+        destination_city TEXT NOT NULL,
+        destination_id   TEXT NOT NULL,
+        month            TEXT NOT NULL,
+        date             TEXT NOT NULL,
+        price            REAL NOT NULL,
+        timestamp        DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(site, origin_id, destination_id, date, session_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ts_session
+        ON train_scouts(session_id, origin_id, destination_id);
 
       CREATE TABLE IF NOT EXISTS itineraries (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -271,9 +315,9 @@ export class FlightDB {
     `);
   }
 
-  insertScout(record: ScoutRecord) {
+  insertScout(record: FlightScoutRecord) {
     const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO scouts
+      INSERT OR REPLACE INTO flight_scouts
       (site, origin, destination, month, date, price, session_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
@@ -291,11 +335,44 @@ export class FlightDB {
   queryScouts(origin: string, destination: string, months: string[]) {
     const placeholders = months.map(() => '?').join(',');
     const stmt = this.db.prepare(`
-      SELECT * FROM scouts
+      SELECT * FROM flight_scouts
       WHERE origin = ? AND destination = ? AND month IN (${placeholders})
       ORDER BY date ASC
     `);
-    return stmt.all(origin, destination, ...months) as ScoutRecord[];
+    return stmt.all(origin, destination, ...months) as FlightScoutRecord[];
+  }
+
+  insertTrainScout(record: TrainScoutRecord): void {
+    this.db.prepare(`
+      INSERT OR REPLACE INTO train_scouts
+        (session_id, site, origin_city, origin_id,
+         destination_city, destination_id, month, date, price)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      record.session_id,
+      record.site,
+      record.origin_city,
+      record.origin_id,
+      record.destination_city,
+      record.destination_id,
+      record.month,
+      record.date,
+      record.price
+    );
+  }
+
+  queryTrainScouts(
+    originId:      string,
+    destinationId: string,
+    months:        string[]
+  ): TrainScoutRecord[] {
+    const placeholders = months.map(() => '?').join(',');
+    return this.db.prepare(`
+      SELECT * FROM train_scouts
+      WHERE origin_id = ? AND destination_id = ?
+        AND month IN (${placeholders})
+      ORDER BY date ASC
+    `).all(originId, destinationId, ...months) as TrainScoutRecord[];
   }
 
   upsertItinerary(rec: ItineraryRecord): number {
@@ -472,8 +549,8 @@ export class FlightDB {
     const rawRetDates    = this.queryScouts(retOrigin, retDestination, params.months);
 
     // Deduplicate: keep cheapest price per date
-    const dedupe = (rows: ScoutRecord[]) => {
-      const map = new Map<string, ScoutRecord>();
+    const dedupe = (rows: FlightScoutRecord[]) => {
+      const map = new Map<string, FlightScoutRecord>();
       for (const d of rows) {
         if (!map.has(d.date) || d.price < map.get(d.date)!.price) map.set(d.date, d);
       }
@@ -509,6 +586,75 @@ export class FlightDB {
             // Only set for open-jaw (when return route differs from default B→A)
             ...(params.return_origin      ? { ret_origin:      params.return_origin }      : {}),
             ...(params.return_destination ? { ret_destination: params.return_destination } : {})
+          });
+        }
+      }
+    }
+
+    return combinations
+      .sort((a, b) => a.total_price - b.total_price)
+      .slice(0, params.top);
+  }
+
+  extractTrainDateCombinations(params: {
+    origin_id:              string;
+    destination_id:         string;
+    origin_city:            string;
+    destination_city:       string;
+    months:                 string[];
+    min_days:               number;
+    max_days:               number;
+    top:                    number;
+    session_id:             string;
+    return_origin_id?:      string;
+    return_destination_id?: string;
+    return_origin_city?:    string;
+    return_destination_city?: string;
+  }): TrainCombinationResult[] {
+
+    const retOriginId      = params.return_origin_id      ?? params.destination_id;
+    const retDestId        = params.return_destination_id ?? params.origin_id;
+    const retOriginCity    = params.return_origin_city      ?? params.destination_city;
+    const retDestCity      = params.return_destination_city ?? params.origin_city;
+
+    const rawOut = this.queryTrainScouts(params.origin_id, params.destination_id, params.months);
+    const rawRet = this.queryTrainScouts(retOriginId, retDestId, params.months);
+
+    // dedupe: keep cheapest price per date
+    const dedupe = (rows: TrainScoutRecord[]) => {
+      const map = new Map<string, TrainScoutRecord>();
+      for (const d of rows) {
+        if (!map.has(d.date) || d.price < map.get(d.date)!.price) map.set(d.date, d);
+      }
+      return Array.from(map.values());
+    };
+
+    const outDates = dedupe(rawOut);
+    const retDates = dedupe(rawRet);
+
+    if (outDates.length === 0) throw new Error(`No train scout data for ${params.origin_city}→${params.destination_city}`);
+    if (retDates.length === 0) throw new Error(`No train scout data for ${retOriginCity}→${retDestCity}`);
+
+    const combinations: TrainCombinationResult[] = [];
+
+    for (const out of outDates) {
+      for (const ret of retDates) {
+        const diffDays = Math.ceil(
+          (new Date(ret.date).getTime() - new Date(out.date).getTime()) / 86_400_000
+        );
+        if (diffDays >= params.min_days && diffDays <= params.max_days) {
+          combinations.push({
+            out_date:         out.date,
+            ret_date:         ret.date,
+            out_price:        out.price,
+            ret_price:        ret.price,
+            total_price:      out.price + ret.price,
+            trip_days:        diffDays,
+            session_id:       params.session_id,
+            origin_city:      params.origin_city,
+            destination_city: params.destination_city,
+            ...(params.return_origin_city      ? { ret_origin_city:      params.return_origin_city }      : {}),
+            ...(params.return_destination_city ? { ret_destination_city: params.return_destination_city } : {})
           });
         }
       }
