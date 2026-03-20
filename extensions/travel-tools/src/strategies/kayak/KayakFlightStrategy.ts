@@ -20,65 +20,43 @@ import {
   FlightScraperStrategy,
   ScoutParams,
   SearchParams,
-  ScraperResult
+  ScraperResult,
+  BatchScoutParams,
+  BatchResult,
+  BatchSearchParams
 } from '../FlightScraperStrategy';
+import { BaseBatchFlightStrategy } from '../BaseBatchStrategy';
 import { FlightDB } from '../../utils/db';
 import { logger } from '../../utils/logger';
 import { McpBrowserSession } from '../../utils/mcp-browser';
 import * as scripts from './kayak-scripts';
+import { buildKayakFlightUrl } from './kayak-flight-url';
 
-// ─── Transport mode ────────────────────────────────────────────────────────────
-
-export type KayakMode = 'flight' | 'train';
-
-// ─── URL builder ──────────────────────────────────────────────────────────────
-
-function buildKayakUrl(params: {
-  origin: string;
-  destination: string;
-  out_date: string;
-  ret_date?: string | null;
-  pax: number;
-  mode: KayakMode;
-}): string {
-  const { origin, destination, out_date, ret_date, pax, mode } = params;
-
-  // Kayak uses uppercase IATA in URLs
-  const org = origin.toUpperCase();
-  const dst = destination.toUpperCase();
-
-  // Date format: YYYY-MM-DD  →  YYYY-MM-DD (unchanged — Kayak accepts ISO)
-  const datePart = ret_date
-    ? `${out_date}/${ret_date}`
-    : out_date;
-
-  // Passenger segment: "2adults/children-0-0-0" (3 child placeholders)
-  const paxPart = `${pax}adults/children-0-0-0`;
-
-  // Filter params
-  const flightFilters = 'fs=stops%3D~0&sort=bestflight_a';
-  const trainFilters  = 'fs=stops%3D~0%3Btransportation%3D-transportation_train_bus&sort=price_a';
-  const filters = mode === 'train' ? trainFilters : flightFilters;
-
-  return `https://www.kayak.es/flights/${org}-${dst}/${datePart}/${paxPart}?${filters}`;
-}
+const SITE_NAME = 'kayak';
+const TRAVEL_MODE = 'flight';
 
 // ─── Strategy ─────────────────────────────────────────────────────────────────
 
-export class KayakFlightStrategy implements FlightScraperStrategy {
-  private mode: KayakMode;
+export class KayakFlightStrategy extends BaseBatchFlightStrategy {
 
-  /**
-   * @param mode  'flight' (default) | 'train'
-   *   Pass 'train' to apply Kayak's transportation filter and tag results
-   *   as site='kayak_train' in the DB so they can be reported separately.
-   */
-  constructor(mode: KayakMode = 'flight') {
-    this.mode = mode;
+  constructor() {
+    super();
   }
 
-  get siteName(): string {
-    return this.mode === 'train' ? 'kayak_train' : 'kayak';
+  // Override batch methods to control concurrency
+  async scoutDatesBatch(params: BatchScoutParams): Promise<BatchResult<ScraperResult>> {
+    // Kayak scout is a no-op, but we still use batch for consistency if called
+    return super.scoutDatesBatch(params);
+  }
+
+  async scrapeFlightsBatch(params: BatchSearchParams): Promise<BatchResult<ScraperResult>> {
+    const CONCURRENCY = 2; // Kayak is sensitive, keep it low
+    return this.runWithConcurrencyLimit(
+      params.items,
+      item  => this.scrapeFlights(item),
+      item  => `${item.origin}->${item.destination}:${item.exact_date}`,
+      CONCURRENCY
+    );
   }
 
   // ── scoutDates ──────────────────────────────────────────────────────────────
@@ -86,30 +64,29 @@ export class KayakFlightStrategy implements FlightScraperStrategy {
   // We return a no-op success so the orchestrator can safely include Kayak in
   // its strategy list without the scout phase failing.
   async scoutDates(_params: ScoutParams): Promise<ScraperResult> {
-    logger.info(`[Kayak/${this.mode}] scoutDates: no-op (Kayak has no month calendar)`);
+    logger.info(`[Kayak/${TRAVEL_MODE}] scoutDates: no-op (Kayak has no month calendar)`);
     return {
       status: 'success',
-      summary: `Kayak (${this.mode}): scoutDates skipped — no month calendar available`
+      summary: `Kayak (${TRAVEL_MODE}): scoutDates skipped — no month calendar available`
     };
   }
 
   // ── scrapeFlights ───────────────────────────────────────────────────────────
   async scrapeFlights(params: SearchParams): Promise<ScraperResult> {
     const db = new FlightDB(params.dbPath);
-    const sessionKey = `kayak-${this.mode}-${params.origin}-${params.destination}-${params.exact_date}`;
+    const sessionKey = `kayak-${TRAVEL_MODE}-${params.origin}-${params.destination}-${params.exact_date}`;
     const browser = new McpBrowserSession(sessionKey);
 
     try {
-      const url = buildKayakUrl({
+      const url = buildKayakFlightUrl({
         origin:      params.origin,
         destination: params.destination,
         out_date:    params.exact_date,
         ret_date:    params.return_date ?? null,
-        pax:         params.pax,
-        mode:        this.mode
+        adults:      params.pax
       });
 
-      logger.info(`[Kayak/${this.mode}] Navigating to: ${url}`);
+      logger.info(`[Kayak/${TRAVEL_MODE}] Navigating to: ${url}`);
 
       await this.startBrowser(browser);
       await browser.callTool('navigate', {
@@ -133,7 +110,7 @@ export class KayakFlightStrategy implements FlightScraperStrategy {
           script: scripts.KAYAK_CHECK_LOADED_JS
         });
         const data = this.parseResult(check);
-        logger.info(`[Kayak/${this.mode}] Poll ${i + 1}: total=${data.total} real=${data.real}`);
+        logger.info(`[Kayak/${TRAVEL_MODE}] Poll ${i + 1}: total=${data.total} real=${data.real}`);
         if ((data.real ?? 0) > 0) { success = true; break; }
         await sleep(2_000);
       }
@@ -168,7 +145,7 @@ export class KayakFlightStrategy implements FlightScraperStrategy {
           script: scripts.KAYAK_DUMP_HTML_JS
         });
         const dumpData = this.parseResult(dump);
-        logger.warn(`[Kayak/${this.mode}] 0 results. Title: "${dumpData.title}". URL: ${url}`);
+        logger.warn(`[Kayak/${TRAVEL_MODE}] 0 results. Title: "${dumpData.title}". URL: ${url}`);
         return {
           status: 'error',
           reason: `0 results. Possible CAPTCHA. Title: ${dumpData.title}`,
@@ -179,7 +156,7 @@ export class KayakFlightStrategy implements FlightScraperStrategy {
       // Persist to DB
       const itinerary_id = db.upsertItinerary({
         session_id:  params.session_id,
-        site:        this.siteName,
+        site:        SITE_NAME,
         origin:      params.origin,
         destination: params.destination,
         out_date:    params.exact_date,
@@ -223,20 +200,20 @@ export class KayakFlightStrategy implements FlightScraperStrategy {
       }
 
       logger.info(
-        `[Kayak/${this.mode}] Saved ${saved} options for ` +
+        `[Kayak/${TRAVEL_MODE}] Saved ${saved} options for ` +
         `${params.origin}->${params.destination} on ${params.exact_date}`
       );
 
       return {
         status:       'success',
-        summary:      `Kayak (${this.mode}): ${saved} options saved for ${params.origin}->${params.destination} on ${params.exact_date}`,
+        summary:      `Kayak (${TRAVEL_MODE}): ${saved} options saved for ${params.origin}->${params.destination} on ${params.exact_date}`,
         flights_found: saved,
         url
       };
 
     } catch (e: any) {
-      logger.error(`[Kayak/${this.mode}] scrapeFlights error: ${e.message}`);
-      db.logError(this.siteName, params.session_id, 'scrapeFlights', e.message);
+      logger.error(`[Kayak/${TRAVEL_MODE}] scrapeFlights error: ${e.message}`);
+      db.logError(SITE_NAME, params.session_id, 'scrapeFlights', e.message);
       return { status: 'error', reason: e.message };
     } finally {
       await browser.close();

@@ -1,10 +1,32 @@
-import { FlightScraperStrategy, ScoutParams, SearchParams, ScraperResult } from '../FlightScraperStrategy';
+import { FlightScraperStrategy, ScoutParams, SearchParams, ScraperResult, BatchScoutParams, BatchResult, BatchSearchParams } from '../FlightScraperStrategy';
+import { BaseBatchFlightStrategy } from '../BaseBatchStrategy';
 import { FlightDB, ItineraryRecord, FlightOptionRecord } from '../../utils/db';
 import { logger } from '../../utils/logger';
 import { McpBrowserSession } from '../../utils/mcp-browser';
 import * as scripts from './skyscanner-scripts';
 
-export class SkyscannerStrategy implements FlightScraperStrategy {
+export class SkyscannerStrategy extends BaseBatchFlightStrategy {
+
+  // Override batch methods to control concurrency
+  async scoutDatesBatch(params: BatchScoutParams): Promise<BatchResult<ScraperResult>> {
+    const CONCURRENCY = 3; // Max 3 Skyscanner browsers in parallel
+    return this.runWithConcurrencyLimit(
+      params.items,
+      item  => this.scoutDates(item),
+      item  => `${item.origin}->${item.destination}:${item.month}`,
+      CONCURRENCY
+    );
+  }
+
+  async scrapeFlightsBatch(params: BatchSearchParams): Promise<BatchResult<ScraperResult>> {
+    const CONCURRENCY = 2; // More aggressive scraping, less concurrency
+    return this.runWithConcurrencyLimit(
+      params.items,
+      item  => this.scrapeFlights(item),
+      item  => `${item.origin}->${item.destination}:${item.exact_date}`,
+      CONCURRENCY
+    );
+  }
 
   async scoutDates(params: ScoutParams): Promise<ScraperResult> {
     const db = new FlightDB(params.dbPath);

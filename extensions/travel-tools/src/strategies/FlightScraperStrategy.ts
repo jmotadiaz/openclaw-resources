@@ -26,7 +26,28 @@ export interface ScraperResult {
   reason?: string;
 }
 
+export interface BatchScoutParams {
+  items: ScoutParams[];
+  session_id: string;
+  dbPath: string;
+}
+
+export interface BatchSearchParams {
+  items: SearchParams[];
+  session_id: string;
+  dbPath: string;
+}
+
+export interface BatchResult<T> {
+  results: Array<T & { label: string; status: 'success' | 'error' }>;
+  summary: { success: number; error: number };
+}
+
 export interface FlightScraperStrategy {
   scoutDates(params: ScoutParams): Promise<ScraperResult>;
   scrapeFlights(params: SearchParams): Promise<ScraperResult>;
+
+  // Batch methods
+  scoutDatesBatch(params: BatchScoutParams): Promise<BatchResult<ScraperResult>>;
+  scrapeFlightsBatch(params: BatchSearchParams): Promise<BatchResult<ScraperResult>>;
 }

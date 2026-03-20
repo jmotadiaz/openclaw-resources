@@ -20,6 +20,15 @@ export interface TrainScraperResult {
   reason?:       string;
 }
 
+import { BatchResult } from './FlightScraperStrategy';
+
+export interface BatchTrainSearchParams {
+  items: TrainSearchParams[];
+  session_id: string;
+  dbPath: string;
+}
+
 export interface TrainScraperStrategy {
   scrapeTrains(params: TrainSearchParams): Promise<TrainScraperResult>;
+  scrapeTrainsBatch(params: BatchTrainSearchParams): Promise<BatchResult<TrainScraperResult>>;
 }

@@ -7,14 +7,27 @@
 // Wait strategy: two-phase progress-bar detection (same as KayakFlightStrategy).
 // Persists to train_itineraries / train_options via FlightDB.
 
-import { TrainScraperStrategy, TrainSearchParams, TrainScraperResult } from '../TrainScraperStrategy';
+import { TrainScraperStrategy, TrainSearchParams, TrainScraperResult, BatchTrainSearchParams } from '../TrainScraperStrategy';
+import { BatchResult } from '../FlightScraperStrategy';
+import { BaseBatchTrainScraperStrategy } from '../BaseBatchStrategy';
 import { FlightDB } from '../../utils/db';
 import { logger }  from '../../utils/logger';
 import { McpBrowserSession } from '../../utils/mcp-browser';
 import * as scripts from './kayak-scripts';
 import { buildKayakTrainUrl } from './kayak-train-url';
 
-export class KayakTrainStrategy implements TrainScraperStrategy {
+export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
+
+  // Override batch methods to control concurrency
+  async scrapeTrainsBatch(params: BatchTrainSearchParams): Promise<BatchResult<TrainScraperResult>> {
+    const CONCURRENCY = 2; // Kayak is sensitive, keep it low
+    return this.runWithConcurrencyLimit(
+      params.items,
+      item  => this.scrapeTrains(item),
+      item  => `${item.origin}->${item.destination}:${item.exact_date}`,
+      CONCURRENCY
+    );
+  }
   get siteName() { return 'kayak_train'; }
 
   async scrapeTrains(params: TrainSearchParams): Promise<TrainScraperResult> {

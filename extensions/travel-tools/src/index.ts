@@ -7,7 +7,6 @@ import { resolve } from 'path';
 import { FlightDB } from './utils/db';
 
 const DB_PATH = resolve(__dirname, '../travel.sqlite');
-const TASK_TIMEOUT_MS = 60_000 * 5; // 5 minutes
 
 export function register(api: any, config: any = {}) {
   const dbPath = config.dbPath || DB_PATH;
@@ -56,42 +55,22 @@ Results are stored in the DB and queryable via find_best_date_combinations.`,
       required: ['session_id', 'routes']
     },
     async execute(_id: string, params: any) {
-      const tasks = params.routes.map((r: any) => ({
-        label:   `skyscanner:${r.origin}->${r.destination}:${r.month}`,
-        route:   `${r.origin}->${r.destination}`,
-        month:   r.month,
-        promise: withTimeout(
-          skyscanner.scoutDates({
-            origin:      r.origin,
-            destination: r.destination,
-            month:       r.month,
-            session_id:  params.session_id,
-            dbPath
-          }),
-          TASK_TIMEOUT_MS,
-          `date_scout skyscanner ${r.origin}->${r.destination} ${r.month}`
-        )
-      }));
-
-      const settled = await Promise.allSettled(tasks.map((t: any) => t.promise));
-
-      const results = settled.map((outcome, i) => {
-        const task = tasks[i];
-        if (outcome.status === 'fulfilled') {
-          return { site: 'skyscanner', route: task.route, month: task.month, ...outcome.value };
-        }
-        return {
-          site: 'skyscanner', route: task.route, month: task.month,
-          status: 'error', reason: outcome.reason?.message ?? String(outcome.reason)
-        };
+      const batchResult = await skyscanner.scoutDatesBatch({
+        session_id: params.session_id,
+        dbPath,
+        items: params.routes.map((r: any) => ({
+          origin:      r.origin,
+          destination: r.destination,
+          month:       r.month,
+          session_id:  params.session_id,
+          dbPath
+        }))
       });
 
-      const allSuccess = results.every(r => r.status === 'success');
-      const anyError   = results.some(r  => r.status === 'error');
-
       return {
-        status: allSuccess ? 'success' : anyError ? 'partial' : 'success',
-        results
+        status:  batchResult.summary.error === 0 ? 'success' : 
+                (batchResult.summary.success > 0 ? 'partial' : 'error'),
+        results: batchResult.results
       };
     }
   }, { optional: true });
@@ -128,42 +107,22 @@ Results stored in train_scouts table, queryable via find_best_train_date_combina
       required: ['session_id', 'routes']
     },
     async execute(_id: string, params: any) {
-      const tasks = params.routes.map((r: any) => ({
-        label:   `trenes_com:${r.origin_city}->${r.destination_city}:${r.month}`,
-        route:   `${r.origin_city}->${r.destination_city}`,
-        month:   r.month,
-        promise: withTimeout(
-          trenesComScout.scoutDates({
-            origin_city:      r.origin_city,
-            destination_city: r.destination_city,
-            month:            r.month,
-            session_id:       params.session_id,
-            dbPath
-          }),
-          TASK_TIMEOUT_MS,
-          `train_scout trenes_com ${r.origin_city}->${r.destination_city} ${r.month}`
-        )
-      }));
-
-      const settled = await Promise.allSettled(tasks.map((t: any) => t.promise));
-
-      const results = settled.map((outcome, i) => {
-        const task = tasks[i];
-        if (outcome.status === 'fulfilled') {
-          return { site: 'trenes_com', route: task.route, month: task.month, ...outcome.value };
-        }
-        return {
-          site: 'trenes_com', route: task.route, month: task.month,
-          status: 'error', reason: outcome.reason?.message ?? String(outcome.reason)
-        };
+      const batchResult = await trenesComScout.scoutDatesBatch({
+        session_id: params.session_id,
+        dbPath,
+        items: params.routes.map((r: any) => ({
+          origin_city:      r.origin_city,
+          destination_city: r.destination_city,
+          month:            r.month,
+          session_id:       params.session_id,
+          dbPath
+        }))
       });
 
-      const allSuccess = results.every(r => r.status === 'success');
-      const anyError   = results.some(r  => r.status === 'error');
-
       return {
-        status: allSuccess ? 'success' : anyError ? 'partial' : 'success',
-        results
+        status:  batchResult.summary.error === 0 ? 'success' : 
+                (batchResult.summary.success > 0 ? 'partial' : 'error'),
+        results: batchResult.results
       };
     }
   }, { optional: true });
@@ -201,53 +160,35 @@ For trains, use the separate train_scraper tool.`,
       required: ['session_id', 'pax', 'combinations']
     },
     async execute(_id: string, params: any) {
-      const tasks = params.combinations.flatMap((c: any) =>
-        flightStrategies.map(s => ({
-          label:       `${s.name}:${c.origin}->${c.destination}:${c.exact_date}`,
-          site:        s.name,
-          route:       `${c.origin}->${c.destination}`,
-          exact_date:  c.exact_date,
-          return_date: c.return_date ?? null,
-          promise: withTimeout(
-            s.strategy.scrapeFlights({
-              origin:      c.origin,
-              destination: c.destination,
-              exact_date:  c.exact_date,
-              return_date: c.return_date,
-              pax:         params.pax,
-              session_id:  params.session_id,
-              dbPath
-            }),
-            TASK_TIMEOUT_MS,
-            `flight_scraper ${s.name} ${c.origin}->${c.destination} ${c.exact_date}`
-          )
-        }))
-      );
+      const allResults: any[] = [];
+      let totalSuccess = 0;
+      let totalError = 0;
 
-      const settled = await Promise.allSettled(tasks.map((t: any) => t.promise));
+      for (const s of flightStrategies) {
+        const batchResult = await s.strategy.scrapeFlightsBatch({
+          session_id: params.session_id,
+          dbPath,
+          items: params.combinations.map((c: any) => ({
+            origin:      c.origin,
+            destination: c.destination,
+            exact_date:  c.exact_date,
+            return_date: c.return_date,
+            pax:         params.pax,
+            session_id:  params.session_id,
+            dbPath
+          }))
+        });
 
-      const results = settled.map((outcome, i) => {
-        const task = tasks[i];
-        if (outcome.status === 'fulfilled') {
-          return {
-            site: task.site, route: task.route,
-            exact_date: task.exact_date, return_date: task.return_date,
-            ...outcome.value
-          };
-        }
-        return {
-          site: task.site, route: task.route,
-          exact_date: task.exact_date, return_date: task.return_date,
-          status: 'error', reason: outcome.reason?.message ?? String(outcome.reason)
-        };
-      });
-
-      const allSuccess = results.every(r => r.status === 'success');
-      const anyError   = results.some(r  => r.status === 'error');
+        // Add site info to results
+        const mapped = batchResult.results.map(r => ({ site: s.name, ...r }));
+        allResults.push(...mapped);
+        totalSuccess += batchResult.summary.success;
+        totalError += batchResult.summary.error;
+      }
 
       return {
-        status: allSuccess ? 'success' : anyError ? 'partial' : 'success',
-        results
+        status: totalError === 0 ? 'success' : (totalSuccess > 0 ? 'partial' : 'error'),
+        results: allResults
       };
     }
   }, { optional: true });
@@ -288,45 +229,35 @@ Results are stored in a separate DB table from flights.`,
       required: ['session_id', 'adults', 'combinations']
     },
     async execute(_id: string, params: any) {
-      const tasks = params.combinations.flatMap((c: any) =>
-        trainStrategies.map(s => ({
-          label:       `${s.name}:${c.origin}->${c.destination}:${c.exact_date}`,
-          site:        s.name,
-          route:       `${c.origin}->${c.destination}`,
-          exact_date:  c.exact_date,
-          return_date: c.return_date ?? null,
-          promise: withTimeout(
-            s.strategy.scrapeTrains({
-              origin:      c.origin,
-              destination: c.destination,
-              exact_date:  c.exact_date,
-              return_date: c.return_date,
-              adults:      params.adults,
-              children:    params.children ?? [],
-              session_id:  params.session_id,
-              dbPath
-            }),
-            TASK_TIMEOUT_MS,
-            `train_scraper ${s.name} ${c.origin}->${c.destination} ${c.exact_date}`
-          )
-        }))
-      );
+      const allResults: any[] = [];
+      let totalSuccess = 0;
+      let totalError = 0;
 
-      const settled = await Promise.allSettled(tasks.map((t: any) => t.promise));
-      const results = settled.map((outcome, i) => {
-        const task = tasks[i];
-        if (outcome.status === 'fulfilled') {
-          return { site: task.site, route: task.route, exact_date: task.exact_date, ...outcome.value };
-        }
-        return {
-          site: task.site, route: task.route, exact_date: task.exact_date,
-          status: 'error', reason: outcome.reason?.message ?? String(outcome.reason)
-        };
-      });
+      for (const s of trainStrategies) {
+        const batchResult = await s.strategy.scrapeTrainsBatch({
+          session_id: params.session_id,
+          dbPath,
+          items: params.combinations.map((c: any) => ({
+            origin:      c.origin,
+            destination: c.destination,
+            exact_date:  c.exact_date,
+            return_date: c.return_date,
+            adults:      params.adults,
+            children:    params.children ?? [],
+            session_id:  params.session_id,
+            dbPath
+          }))
+        });
+
+        const mapped = batchResult.results.map(r => ({ site: s.name, ...r }));
+        allResults.push(...mapped);
+        totalSuccess += batchResult.summary.success;
+        totalError += batchResult.summary.error;
+      }
 
       return {
-        status: results.every(r => r.status === 'success') ? 'success' : 'partial',
-        results
+        status: totalError === 0 ? 'success' : (totalSuccess > 0 ? 'partial' : 'error'),
+        results: allResults
       };
     }
   }, { optional: true });
@@ -527,12 +458,3 @@ Do NOT call multiple times for the same session/dates.`,
   });
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  let timeoutId: any;
-  const timeout = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => {
-      reject(new Error(`TASK_TIMEOUT: ${label} (exceeded ${ms}ms)`));
-    }, ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
-}
