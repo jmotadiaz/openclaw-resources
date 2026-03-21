@@ -185,6 +185,66 @@ export interface TrainQueryResultRow {
   ret_changes:   number | null;
 }
 
+// ─── Camper interfaces ────────────────────────────────────────────────────────
+
+export interface CamperItineraryRecord {
+  session_id:  string;
+  city:        string;
+  where_label: string;
+  latitude:    number;
+  longitude:   number;
+  radius:      number;
+  date_from:   string;
+  date_to:     string;
+  types:       number[] | null;
+  seatbelts:   number | null;
+  beds:        number | null;
+  equipment:   string[];
+  total_count: number;
+  search_url:  string;
+}
+
+export interface CamperOptionRecord {
+  camper_id:       number;
+  ad_url:          string;
+  title:           string;
+  vehicle_type:    string;
+  seats:           number;
+  beds:            number;
+  price_per_day:   number;
+  total_price:     number;
+  instant_booking: boolean;
+  rating:          number | null;
+  rating_count:    number;
+}
+
+export interface CamperQueryParams {
+  session_id: string;
+  city?:      string;
+  date_from?: string;
+  date_to?:   string;
+  sort_by?:   'price' | 'rating' | 'price_per_day';
+  sort_dir?:  'asc' | 'desc';
+  limit?:     number;
+}
+
+export interface CamperOptionRow extends CamperItineraryRecord {
+  id:              number; // itinerary_id
+  option_id:       number;
+  camper_id:       number;
+  ad_url:          string;
+  title:           string;
+  vehicle_type:    string;
+  seats:           number;
+  beds:            number;
+  price_per_day:   number;
+  total_price:     number;
+  instant_booking: number; // 0 | 1 in SQLite
+  rating:          number | null;
+  rating_count:    number;
+  scraped_at:      string;
+}
+
 export class FlightDB {
   private db: Database.Database;
 
@@ -307,6 +367,48 @@ export class FlightDB {
         context    TEXT,
         timestamp  DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+
+      CREATE TABLE IF NOT EXISTS camper_itineraries (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id  TEXT    NOT NULL,
+        city        TEXT    NOT NULL,
+        where_label TEXT    NOT NULL,
+        latitude    REAL    NOT NULL,
+        longitude   REAL    NOT NULL,
+        radius      INTEGER NOT NULL,
+        date_from   TEXT    NOT NULL,
+        date_to     TEXT    NOT NULL,
+        types       TEXT,
+        seatbelts   INTEGER,
+        beds        INTEGER,
+        equipment   TEXT,
+        total_count INTEGER,
+        search_url  TEXT,
+        scraped_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(session_id, city, date_from, date_to, types, seatbelts, beds, equipment)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_ci_session
+        ON camper_itineraries(session_id, city, date_from, date_to);
+
+      CREATE TABLE IF NOT EXISTS camper_options (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        itinerary_id     INTEGER NOT NULL REFERENCES camper_itineraries(id) ON DELETE CASCADE,
+        camper_id        INTEGER NOT NULL,
+        ad_url           TEXT    NOT NULL,
+        title            TEXT,
+        vehicle_type     TEXT,
+        seats            INTEGER,
+        beds             INTEGER,
+        price_per_day    REAL,
+        total_price      REAL,
+        instant_booking  INTEGER NOT NULL DEFAULT 0,
+        rating           REAL,
+        rating_count     INTEGER,
+        UNIQUE(itinerary_id, camper_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_co_price ON camper_options(itinerary_id, total_price);
     `);
   }
 
@@ -776,6 +878,123 @@ export class FlightDB {
 
     const wrapped = `SELECT * FROM (${q}) WHERE rn <= ?`;
     return this.db.prepare(wrapped).all(...toP) as TrainQueryResultRow[];
+  }
+
+  // ─── Camper CRUD ────────────────────────────────────────────────────────────
+
+  upsertCamperItinerary(rec: CamperItineraryRecord): number {
+    this.db.prepare(`
+      INSERT INTO camper_itineraries
+        (session_id, city, where_label, latitude, longitude, radius,
+         date_from, date_to, types, seatbelts, beds, equipment,
+         total_count, search_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, city, date_from, date_to, types, seatbelts, beds, equipment)
+      DO UPDATE SET
+        total_count = excluded.total_count,
+        search_url  = excluded.search_url,
+        scraped_at  = CURRENT_TIMESTAMP
+    `).run(
+      rec.session_id,
+      rec.city,
+      rec.where_label,
+      rec.latitude,
+      rec.longitude,
+      rec.radius,
+      rec.date_from,
+      rec.date_to,
+      rec.types ? JSON.stringify(rec.types) : null,
+      rec.seatbelts,
+      rec.beds,
+      JSON.stringify(rec.equipment),
+      rec.total_count,
+      rec.search_url
+    );
+
+    const row = this.db.prepare(`
+      SELECT id FROM camper_itineraries
+      WHERE session_id = ? AND city = ? AND date_from = ? AND date_to = ?
+        AND (types IS ? OR types = ?)
+        AND (seatbelts IS ? OR seatbelts = ?)
+        AND (beds IS ? OR beds = ?)
+        AND equipment = ?
+    `).get(
+      rec.session_id,
+      rec.city,
+      rec.date_from,
+      rec.date_to,
+      rec.types ? JSON.stringify(rec.types) : null,
+      rec.types ? JSON.stringify(rec.types) : null,
+      rec.seatbelts,
+      rec.seatbelts,
+      rec.beds,
+      rec.beds,
+      JSON.stringify(rec.equipment)
+    ) as { id: number } | undefined;
+
+    if (!row) throw new Error(`upsertCamperItinerary: could not retrieve id after upsert`);
+    return row.id;
+  }
+
+  insertCamperOption(itinerary_id: number, opt: CamperOptionRecord): void {
+    this.db.prepare(`
+      INSERT OR REPLACE INTO camper_options
+        (itinerary_id, camper_id, ad_url, title, vehicle_type,
+         seats, beds, price_per_day, total_price, instant_booking,
+         rating, rating_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      itinerary_id,
+      opt.camper_id,
+      opt.ad_url,
+      opt.title,
+      opt.vehicle_type,
+      opt.seats,
+      opt.beds,
+      opt.price_per_day,
+      opt.total_price,
+      opt.instant_booking ? 1 : 0,
+      opt.rating,
+      opt.rating_count
+    );
+  }
+
+  queryCamperOptions(params: CamperQueryParams): CamperOptionRow[] {
+    const limit = params.limit ?? 5;
+    const orderCol =
+      params.sort_by === 'rating'        ? 'co.rating' :
+      params.sort_by === 'price_per_day' ? 'co.price_per_day' :
+      'co.total_price';
+    const orderDir = params.sort_dir === 'desc' ? 'DESC' : 'ASC';
+
+    let filters = 'ci.session_id = ?';
+    const p: any[] = [params.session_id];
+
+    if (params.city)      { filters += ' AND ci.city = ?';      p.push(params.city); }
+    if (params.date_from) { filters += ' AND ci.date_from = ?'; p.push(params.date_from); }
+    if (params.date_to)   { filters += ' AND ci.date_to = ?';   p.push(params.date_to); }
+
+    const q = `
+      SELECT
+        ci.id, ci.session_id, ci.city, ci.where_label, ci.latitude, ci.longitude, ci.radius,
+        ci.date_from, ci.date_to, ci.types, ci.seatbelts, ci.beds, ci.equipment,
+        ci.total_count, ci.search_url, ci.scraped_at,
+        co.id AS option_id, co.camper_id, co.ad_url, co.title, co.vehicle_type,
+        co.seats, co.beds, co.price_per_day, co.total_price, co.instant_booking,
+        co.rating, co.rating_count,
+        ROW_NUMBER() OVER (
+          PARTITION BY ci.id
+          ORDER BY ${orderCol} ${orderDir}
+        ) AS rn
+      FROM camper_options co
+      JOIN camper_itineraries ci ON ci.id = co.itinerary_id
+      WHERE ${filters}
+    `;
+
+    const wrapped = `SELECT * FROM (${q}) WHERE rn <= ?`;
+    p.push(limit);
+
+    return this.db.prepare(wrapped).all(...p) as any[];
   }
 
   // ─── Error logging ──────────────────────────────────────────────────────────

@@ -19,6 +19,12 @@ import {
   TrainScraperResult,
   BatchTrainSearchParams
 } from './TrainScraperStrategy';
+import {
+  CamperScraperStrategy,
+  CamperSearchParams,
+  CamperScraperResult,
+  BatchCamperSearchParams,
+} from './CamperScraperStrategy';
 
 // Core logic for formatting results and concurrency control
 export class BatchHelper {
@@ -153,5 +159,38 @@ export abstract class BaseBatchTrainScraperStrategy extends BaseBatchStrategy im
     return this.formatBatchResult(settled, params.items.map(item =>
       `${item.origin}->${item.destination}:${item.exact_date}`
     ));
+  }
+}
+
+export abstract class BaseBatchCamperStrategy
+  extends BaseBatchStrategy
+  implements CamperScraperStrategy
+{
+  abstract scrapeCampers(
+    params: CamperSearchParams,
+  ): Promise<CamperScraperResult>;
+
+  async scrapeCampersBatch(
+    params: BatchCamperSearchParams,
+  ): Promise<BatchResult<CamperScraperResult>> {
+    const CONCURRENCY = 3; // HTTP puro — sin browser
+    return this.runWithConcurrencyLimit(
+      params.combinations,
+      (combo) =>
+        this.scrapeCampers({
+          session_id: params.session_id,
+          dbPath:     params.dbPath,
+          city:       combo.city,
+          date_from:  combo.date_from,
+          date_to:    combo.date_to,
+          types:      params.types,
+          seatbelts:  params.seatbelts,
+          beds:       params.beds,
+          equipment:  params.equipment,
+          page_size:  params.page_size,
+        }),
+      (combo) => `${combo.city}:${combo.date_from}→${combo.date_to}`,
+      CONCURRENCY,
+    );
   }
 }

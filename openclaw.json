@@ -115,6 +115,8 @@
             "find_best_train_date_combinations",
             "consolidate_final_flight_report",
             "consolidate_final_train_report",
+            "camper_scraper",
+            "consolidate_final_camper_report",
             "group:sessions"
           ],
           "deny": [
