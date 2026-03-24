@@ -25,6 +25,7 @@ import {
   CamperScraperResult,
   BatchCamperSearchParams,
 } from './CamperScraperStrategy';
+import { logger } from '../utils/logger';
 
 // Core logic for formatting results and concurrency control
 export class BatchHelper {
@@ -72,6 +73,7 @@ export class BatchHelper {
           const result = await fn(item);
           results.push({ label, status: 'success', ...result as any });
         } catch (e: any) {
+          logger.error(`[BatchCamper] Item failed: label="${label}" reason="${e.message}"`);
           results.push({ label, status: 'error', reason: e.message });
         } finally {
           if (p) inFlight.delete(p);
@@ -174,7 +176,7 @@ export abstract class BaseBatchCamperStrategy
     params: BatchCamperSearchParams,
   ): Promise<BatchResult<CamperScraperResult>> {
     const CONCURRENCY = 3; // HTTP puro — sin browser
-    return this.runWithConcurrencyLimit(
+    const result = await this.runWithConcurrencyLimit(
       params.combinations,
       (combo) =>
         this.scrapeCampers({
@@ -192,5 +194,15 @@ export abstract class BaseBatchCamperStrategy
       (combo) => `${combo.city}:${combo.date_from}→${combo.date_to}`,
       CONCURRENCY,
     );
+
+    // Log de resumen para detectar pérdidas
+    const failed = result.results.filter(r => r.status === 'error');
+    if (failed.length > 0) {
+      logger.warn(
+        `[BatchCamper] ${failed.length} combinations failed: ${failed.map(r => r.label).join(', ')}`
+      );
+    }
+
+    return result;
   }
 }

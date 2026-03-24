@@ -92,6 +92,7 @@
         "mode": "safeguard"
       },
       "maxConcurrent": 4,
+      "timeoutSeconds": 600,
       "subagents": {
         "maxConcurrent": 8,
         "maxSpawnDepth": 2,
@@ -119,10 +120,12 @@
             "consolidate_final_flight_report",
             "consolidate_final_train_report",
             "send_report_email",
+            "camper_fetch",
             "group:sessions"
           ],
           "deny": [
-            "exec"
+            "exec",
+            "camper_store"
           ]
         }
       },
@@ -175,7 +178,8 @@
           "allow": [
             "read",
             "camper_scraper",
-            "fetch_campers_for_analysis"
+            "fetch_campers_for_analysis",
+            "camper_store"
           ],
           "deny": [
             "write",
@@ -196,7 +200,8 @@
             "find_best_date_combinations",
             "find_best_train_date_combinations",
             "consolidate_final_flight_report",
-            "consolidate_final_train_report"
+            "consolidate_final_train_report",
+            "camper_fetch"
           ]
         }
       }

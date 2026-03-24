@@ -7,8 +7,9 @@ import { YescapaStrategy } from "./strategies/yescapa/YescapaStrategy";
 import { CamperScraperStrategy } from "./strategies/CamperScraperStrategy";
 import { resolve } from "path";
 import { readFileSync } from "fs";
-import { FlightDB } from "./utils/db";
+import { TravelDB } from "./utils/db";
 import { logger } from "./utils/logger";
+import { camperWrite, camperRead } from "./utils/store";
 
 const DB_PATH = resolve(__dirname, "../travel.sqlite");
 
@@ -358,7 +359,7 @@ Results are stored in a separate DB table from flights.`,
       required: ["origin", "destination", "session_id"],
     },
     async execute(_id: string, params: any) {
-      const db = new FlightDB(dbPath);
+      const db = new TravelDB(dbPath);
       try {
         const months = params.months
           ? params.months.split(",").map((m: string) => m.trim())
@@ -426,7 +427,7 @@ City names must match exactly what was passed to train_scout.`,
       required: ["session_id", "origin_city", "destination_city"],
     },
     async execute(_id: string, params: any) {
-      const db = new FlightDB(dbPath);
+      const db = new TravelDB(dbPath);
       try {
         const months = params.months
           ? params.months.split(",").map((m: string) => m.trim())
@@ -511,7 +512,7 @@ Do NOT call multiple times for the same session/dates.`,
       required: ["session_id"],
     },
     async execute(_id: string, params: any) {
-      const db = new FlightDB(dbPath);
+      const db = new TravelDB(dbPath);
       try {
         const results = db.queryFlightOptions({
           session_id: params.session_id,
@@ -553,7 +554,7 @@ Do NOT call multiple times for the same session/dates.`,
       required: ["session_id"],
     },
     async execute(_id: string, params: any) {
-      const db = new FlightDB(dbPath);
+      const db = new TravelDB(dbPath);
       try {
         const results = db.queryTrainOptions({
           session_id: params.session_id,
@@ -581,38 +582,57 @@ Do NOT call multiple times for the same session/dates.`,
   // ─────────────────────────────────────────────────────────────────────────
   api.registerTool({
     name: "fetch_campers_for_analysis",
-    description: `Retrieves top-N campers per vehicle type for LLM reranking.
+    description: `Retrieves top-N campers per vehicle type for LLM reranking across multiple date combinations.
 Returns raw camper data including coordinates. Intended to be passed
-to the camper-analyzer subagent, not displayed directly.`,
+to the camper-analyzer subagent, not displayed directly.
+CALL EXACTLY ONCE with all combinations that succeeded scraping.`,
     parameters: {
       type: "object",
       properties: {
         session_id: { type: "string" },
-        city: { type: "string" },
-        date_from: { type: "string", description: "YYYY-MM-DD" },
-        date_to: { type: "string", description: "YYYY-MM-DD" },
+        combinations: {
+          type: "array",
+          description: "List of combinations to fetch data for",
+          items: {
+            type: "object",
+            properties: {
+              city: { type: "string" },
+              date_from: { type: "string", description: "YYYY-MM-DD" },
+              date_to: { type: "string", description: "YYYY-MM-DD" },
+            },
+            required: ["city", "date_from", "date_to"],
+          },
+        },
         limit_per_type: {
           type: "number",
-          description: "Max per vehicle_type (default 10)",
+          description: "Max per vehicle_type (default 5)",
         },
       },
-      required: ["session_id"],
+      required: ["session_id", "combinations"],
     },
     async execute(_id: string, params: any) {
-      const db = new FlightDB(dbPath);
+      const t0 = Date.now();
+      const db = new TravelDB(dbPath);
       try {
-        const results = db.queryCamperOptions({
+        logger.info(
+          `[fetch_campers_for_analysis] START session=${params.session_id} city=${params.city} date=${params.date_from}→${params.date_to}`,
+        );
+        const results = db.queryCamperOptionsMulti({
           session_id: params.session_id,
-          city: params.city,
-          date_from: params.date_from,
-          date_to: params.date_to,
-          limit: params.limit_per_type ?? 10,
+          combinations: params.combinations,
+          limit: params.limit_per_type ?? 5,
           group_by_type: true,
           sort_by: "price",
           sort_dir: "asc",
         });
+        logger.info(
+          `[fetch_campers_for_analysis] session=${params.session_id} city=${params.city} date=${params.date_from}→${params.date_to} rows=${results.length} took=${Date.now() - t0}ms`,
+        );
         return { status: "success", data: results };
       } catch (error: any) {
+        logger.error(
+          `[fetch_campers_for_analysis] FAILED after ${Date.now() - t0}ms — ${error.message}`,
+        );
         return { status: "error", message: error.message };
       } finally {
         db.close();
@@ -688,7 +708,9 @@ Devuelve el total_count y guarda el JSON completo en disco.`,
         required: ["session_id", "combinations"],
       },
       async execute(_id: string, params: any) {
-        logger.info(`[Tool/camper_scraper] Inciando búsqueda para ${params.combinations.length} combinaciones (Session: ${params.session_id})`);
+        logger.info(
+          `[Tool/camper_scraper] Inciando búsqueda para ${params.combinations.length} combinaciones (Session: ${params.session_id})`,
+        );
         const allResults: any[] = [];
         let totalSuccess = 0;
         let totalError = 0;
@@ -714,7 +736,9 @@ Devuelve el total_count y guarda el JSON completo en disco.`,
           totalError += batchResult.summary.error;
         }
 
-        logger.info(`[Tool/camper_scraper] Completado: ${totalSuccess} success, ${totalError} error.`);
+        logger.info(
+          `[Tool/camper_scraper] Completado: ${totalSuccess} success, ${totalError} error.`,
+        );
         return {
           status:
             totalError === 0
@@ -811,4 +835,95 @@ recipient configured in the email service.`,
     },
     { optional: true },
   );
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // TOOL: camper_store
+  // ─────────────────────────────────────────────────────────────────────────
+  api.registerTool(
+    {
+      name: "camper_store",
+      description: `Persists a camper results payload to internal extension storage (store/campers/),
+keyed by session_id + namespace. Use from the camper-orchestrator subagent to pass
+structured results back to the orchestrator without needing workspace write access.
+The orchestrator retrieves it via camper_fetch once the subagent completes.`,
+      parameters: {
+        type: "object",
+        properties: {
+          session_id: {
+            type: "string",
+            description:
+              "Orchestrator session ID — must match the parent session.",
+          },
+          namespace: {
+            type: "string",
+            description:
+              'Logical name for this payload, e.g. "results". Unique per session.',
+          },
+          data: {
+            type: "object",
+            description:
+              "Arbitrary JSON payload to store (camper results, markdown, etc.).",
+          },
+        },
+        required: ["session_id", "namespace", "data"],
+      },
+      async execute(_id: string, params: any) {
+        try {
+          camperWrite(params.session_id, params.namespace, params.data);
+          return {
+            status: "success",
+            session_id: params.session_id,
+            namespace: params.namespace,
+          };
+        } catch (e: any) {
+          return { status: "error", message: e.message };
+        }
+      },
+    },
+    { optional: true },
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // TOOL: camper_fetch
+  // ─────────────────────────────────────────────────────────────────────────
+  api.registerTool({
+    name: "camper_fetch",
+    description: `Retrieves a camper results payload previously stored via camper_store.
+Call from the orchestrator after the camper-orchestrator subagent completion event.
+Returns status "not_found" if no payload exists yet for the given session_id + namespace.`,
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description: "Orchestrator session ID.",
+        },
+        namespace: {
+          type: "string",
+          description: 'Logical name used when storing, e.g. "results".',
+        },
+      },
+      required: ["session_id", "namespace"],
+    },
+    async execute(_id: string, params: any) {
+      try {
+        const data = camperRead(params.session_id, params.namespace);
+        if (data === null) {
+          return {
+            status: "not_found",
+            session_id: params.session_id,
+            namespace: params.namespace,
+          };
+        }
+        return {
+          status: "success",
+          session_id: params.session_id,
+          namespace: params.namespace,
+          data,
+        };
+      } catch (e: any) {
+        return { status: "error", message: e.message };
+      }
+    },
+  });
 }

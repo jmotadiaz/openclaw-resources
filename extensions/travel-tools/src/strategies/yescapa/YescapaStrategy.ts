@@ -3,8 +3,8 @@
 import * as https from "https";
 import * as fs from "fs";
 import * as path from "path";
-import { logger } from "../../utils/logger";
-import { FlightDB } from "../../utils/db";
+import { logger, getLogsDir } from "../../utils/logger";
+import { TravelDB } from "../../utils/db";
 import { BaseBatchCamperStrategy } from "../BaseBatchStrategy";
 import {
   CamperSearchParams,
@@ -42,17 +42,8 @@ const REGEX_FALLBACK_2 =
   /api[^}]{0,50}jelouemoncampingcar[^}]{0,200}"([A-Za-z0-9\-_\.]{30,})"/;
 
 export class YescapaStrategy extends BaseBatchCamperStrategy {
-  private logsDir = path.resolve(__dirname, "../../../logs");
-
   constructor() {
     super();
-    if (!fs.existsSync(this.logsDir)) {
-      try {
-        fs.mkdirSync(this.logsDir, { recursive: true });
-      } catch (e: any) {
-        logger.error(`[Yescapa] Error creating logs dir: ${e.message}`);
-      }
-    }
   }
 
   async scrapeCampers(
@@ -72,7 +63,7 @@ export class YescapaStrategy extends BaseBatchCamperStrategy {
 
       if (!apiKey) {
         const dumpPath = path.join(
-          this.logsDir,
+          getLogsDir(),
           `yescapa-home-${timestamp}.html`,
         );
         fs.writeFileSync(dumpPath, html, "utf8");
@@ -99,7 +90,9 @@ export class YescapaStrategy extends BaseBatchCamperStrategy {
       let firstPageSearchUrl = "";
 
       for (const page of [1, 2]) {
-        logger.info(`[Yescapa/L1] [${params.city}] [Página ${page}/2] Preparando búsqueda...`);
+        logger.info(
+          `[Yescapa/L1] [${params.city}] [Página ${page}/2] Preparando búsqueda...`,
+        );
         const searchUrl = this.buildSearchUrl({
           ...loc,
           date_from: params.date_from,
@@ -124,7 +117,7 @@ export class YescapaStrategy extends BaseBatchCamperStrategy {
         const data = JSON.parse(json);
 
         const jsonPath = path.join(
-          this.logsDir,
+          getLogsDir(),
           `yescapa-response-p${page}-${timestamp}.json`,
         );
         fs.writeFileSync(jsonPath, json, "utf8");
@@ -140,10 +133,12 @@ export class YescapaStrategy extends BaseBatchCamperStrategy {
         if (!data.next) break;
       }
 
-      logger.info(`[Yescapa/L1] [${params.city}] Total combinado: ${allResults.length} resultados`);
+      logger.info(
+        `[Yescapa/L1] [${params.city}] Total combinado: ${allResults.length} resultados`,
+      );
 
       // Paso 4 — Persistencia en BD
-      const db = new FlightDB(params.dbPath);
+      const db = new TravelDB(params.dbPath);
       let savedCount = 0;
       try {
         const itineraryId = db.upsertCamperItinerary({
@@ -185,7 +180,9 @@ export class YescapaStrategy extends BaseBatchCamperStrategy {
         db.close();
       }
 
-      logger.info(`[Yescapa/L1] [${params.city}] Scraping finalizado con éxito: ${allResults.length} encontrados, ${savedCount} guardados.`);
+      logger.info(
+        `[Yescapa/L1] [${params.city}] Scraping finalizado con éxito: ${allResults.length} encontrados, ${savedCount} guardados.`,
+      );
       return {
         status: "success",
         city: params.city,

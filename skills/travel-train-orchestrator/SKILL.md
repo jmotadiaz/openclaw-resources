@@ -187,12 +187,21 @@ consolidate_final_train_report(
 
 #### 4b — Insert camper results
 
-#### 4b — Insert camper results
+Si el subagente `camper-orchestrator` aún no ha terminado, haz yield y espera su evento de finalización.
 
-If the `camper-orchestrator` subagent has NOT finished yet, you MUST yield and wait for its announcement now.
-Do not write the final report until you receive the camper results.
+Una vez recibido el evento, llama a `camper_fetch`:
 
-Once you have the results, insert each markdown block into `report.md` below the train section of the corresponding date option.
+```
+camper_fetch(
+  session_id: "{session_id}",
+  namespace: "results"
+)
+```
+
+- `status: "success"` → extrae `data.markdown` e insértalo en `report.md` debajo de la sección de trenes de cada opción de fecha.
+- `status: "not_found"` → anota `⚠️ Campers no disponibles` en el report y continúa.
+
+**No uses el resultado del evento de auto-announce** — puede estar truncado por el proxy LLM.
 
 #### 4c — Write the Report
 

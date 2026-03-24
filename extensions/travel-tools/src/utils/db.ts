@@ -231,8 +231,15 @@ export interface CamperQueryParams {
   group_by_type?: boolean; // ← nuevo
 }
 
-export interface CamperOptionRow extends CamperItineraryRecord {
-  id: number; // itinerary_id
+// Nueva interfaz — output mínimo para análisis LLM
+export interface CamperAnalysisRow {
+  // de camper_itineraries
+  session_id: string;
+  city: string;
+  date_from: string;
+  date_to: string;
+  search_url: string;
+  // de camper_options
   option_id: number;
   camper_id: number;
   ad_url: string;
@@ -242,15 +249,14 @@ export interface CamperOptionRow extends CamperItineraryRecord {
   beds: number;
   price_per_day: number;
   total_price: number;
-  instant_booking: number; // 0 | 1 in SQLite
+  instant_booking: number; // 0 | 1
   rating: number | null;
   rating_count: number;
-  latitude: number | null; // ← nuevo
-  longitude: number | null; // ← nuevo
-  scraped_at: string;
+  latitude: number | null;
+  longitude: number | null;
 }
 
-export class FlightDB {
+export class TravelDB {
   private db: Database.Database;
 
   constructor(dbPath: string) {
@@ -416,6 +422,8 @@ export class FlightDB {
       );
 
       CREATE INDEX IF NOT EXISTS idx_co_price ON camper_options(itinerary_id, total_price);
+      CREATE INDEX IF NOT EXISTS idx_co_type_price
+        ON camper_options(itinerary_id, vehicle_type, total_price);
     `);
   }
 
@@ -1107,19 +1115,19 @@ export class FlightDB {
       );
   }
 
-  queryCamperOptions(params: CamperQueryParams): CamperOptionRow[] {
+  queryCamperOptions(params: CamperQueryParams): CamperAnalysisRow[] {
     const limit = params.limit ?? 10;
     const orderCol =
       params.sort_by === "rating"
-        ? "co.rating"
+        ? "rating"
         : params.sort_by === "price_per_day"
-          ? "co.price_per_day"
-          : "co.total_price";
+          ? "price_per_day"
+          : "total_price";
     const orderDir = params.sort_dir === "desc" ? "DESC" : "ASC";
 
     const partition = params.group_by_type
-      ? "PARTITION BY ci.id, co.vehicle_type"
-      : "PARTITION BY ci.id";
+      ? "PARTITION BY session_id, city, date_from, date_to, vehicle_type"
+      : "PARTITION BY session_id, city, date_from, date_to";
 
     let filters = `ci.session_id = ?`;
     const p: any[] = [params.session_id];
@@ -1137,30 +1145,83 @@ export class FlightDB {
       p.push(params.date_to);
     }
 
-
-
     const q = `
-      SELECT
-        ci.id, ci.session_id, ci.city, ci.where_label,
-        ci.latitude AS itinerary_latitude, ci.longitude AS itinerary_longitude,
-        ci.radius, ci.date_from, ci.date_to, ci.types, ci.seatbelts,
-        ci.beds, ci.equipment, ci.total_count, ci.search_url, ci.scraped_at,
-        co.id AS option_id, co.camper_id, co.ad_url, co.title, co.vehicle_type,
-        co.seats, co.beds, co.price_per_day, co.total_price, co.instant_booking,
-        co.rating, co.rating_count, co.latitude, co.longitude,
-        ROW_NUMBER() OVER (
-          ${partition}
-          ORDER BY ${orderCol} ${orderDir}
-        ) AS rn
-      FROM camper_options co
-      JOIN camper_itineraries ci ON ci.id = co.itinerary_id
-      WHERE ${filters}
+      WITH filtered AS (
+        SELECT
+          ci.session_id, ci.city, ci.date_from, ci.date_to, ci.search_url,
+          co.id AS option_id, co.camper_id, co.ad_url, co.title, co.vehicle_type,
+          co.seats, co.beds, co.price_per_day, co.total_price, co.instant_booking,
+          co.rating, co.rating_count, co.latitude, co.longitude
+        FROM camper_options co
+        JOIN camper_itineraries ci ON ci.id = co.itinerary_id
+        WHERE ${filters}
+      ),
+      ranked AS (
+        SELECT *,
+          ROW_NUMBER() OVER (
+            ${partition}
+            ORDER BY ${orderCol} ${orderDir}
+          ) AS rn
+        FROM filtered
+      )
+      SELECT * FROM ranked WHERE rn <= ?
     `;
 
-    const wrapped = `SELECT * FROM (${q}) WHERE rn <= ?`;
     p.push(limit);
+    return this.db.prepare(q).all(...p) as CamperAnalysisRow[];
+  }
 
-    return this.db.prepare(wrapped).all(...p) as any[];
+  queryCamperOptionsMulti(params: {
+    session_id: string;
+    combinations: Array<{ city: string; date_from: string; date_to: string }>;
+    limit: number;
+    sort_by?: "price" | "rating" | "price_per_day";
+    sort_dir?: "asc" | "desc";
+    group_by_type?: boolean;
+  }): CamperAnalysisRow[] {
+    const orderCol =
+      params.sort_by === "rating"
+        ? "rating"
+        : params.sort_by === "price_per_day"
+          ? "price_per_day"
+          : "total_price";
+    const orderDir = params.sort_dir === "desc" ? "DESC" : "ASC";
+
+    const partition = params.group_by_type
+      ? "PARTITION BY city, date_from, date_to, vehicle_type"
+      : "PARTITION BY city, date_from, date_to";
+
+    const p: any[] = [params.session_id];
+    const clauses = params.combinations.map((c) => {
+      p.push(c.city, c.date_from, c.date_to);
+      return `(ci.city = ? AND ci.date_from = ? AND ci.date_to = ?)`;
+    });
+
+    const q = `
+      WITH filtered AS (
+        SELECT
+          ci.session_id, ci.city, ci.date_from, ci.date_to, ci.search_url,
+          co.id AS option_id, co.camper_id, co.ad_url, co.title, co.vehicle_type,
+          co.seats, co.beds, co.price_per_day, co.total_price, co.instant_booking,
+          co.rating, co.rating_count, co.latitude, co.longitude
+        FROM camper_options co
+        JOIN camper_itineraries ci ON ci.id = co.itinerary_id
+        WHERE ci.session_id = ?
+          AND (${clauses.join(" OR ")})
+      ),
+      ranked AS (
+        SELECT *,
+          ROW_NUMBER() OVER (
+            ${partition}
+            ORDER BY ${orderCol} ${orderDir}
+          ) AS rn
+        FROM filtered
+      )
+      SELECT * FROM ranked WHERE rn <= ?
+    `;
+
+    p.push(params.limit);
+    return this.db.prepare(q).all(...p) as CamperAnalysisRow[];
   }
 
   // ─── Error logging ──────────────────────────────────────────────────────────
