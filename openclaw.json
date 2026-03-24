@@ -1,7 +1,7 @@
 {
   "meta": {
-    "lastTouchedVersion": "2026.3.11",
-    "lastTouchedAt": "2026-03-13T09:57:50.451Z"
+    "lastTouchedVersion": "2026.3.13",
+    "lastTouchedAt": "2026-03-23T08:20:55.566Z"
   },
   "wizard": {
     "lastRunAt": "2026-03-12T15:06:48.205Z",
@@ -102,6 +102,9 @@
       {
         "id": "main",
         "default": true,
+        "subagents": {
+          "allowAgents": ["camper-orchestrator", "worker"]
+        },
         "workspace": "/home/openclaw/.openclaw/workspace",
         "tools": {
           "allow": [
@@ -115,8 +118,7 @@
             "find_best_train_date_combinations",
             "consolidate_final_flight_report",
             "consolidate_final_train_report",
-            "camper_scraper",
-            "consolidate_final_camper_report",
+            "send_report_email",
             "group:sessions"
           ],
           "deny": [
@@ -128,7 +130,7 @@
         "id": "worker",
         "name": "worker",
         "workspace": "/home/openclaw/.openclaw/workspace-worker",
-        "agentDir": "/home/openclaw/.openclaw/agents/worker/agent",
+        "agentDir": "/home/openclaw/.openclaw/agents/worker",
         "model": {
           "primary": "litellm/subagent"
         },
@@ -157,6 +159,46 @@
             "write"
           ]
         }
+      },
+      {
+        "id": "camper-orchestrator",
+        "name": "camper-orchestrator",
+        "workspace": "/home/openclaw/.openclaw/workspace-camper-orchestrator",
+        "agentDir": "/home/openclaw/.openclaw/agents/camper-orchestrator",
+        "model": {
+          "primary": "litellm/orchestrator"
+        },
+        "sandbox": {
+          "mode": "off"
+        },
+        "tools": {
+          "allow": [
+            "read",
+            "camper_scraper",
+            "fetch_campers_for_analysis"
+          ],
+          "deny": [
+            "write",
+            "exec",
+            "browser",
+            "web_fetch",
+            "edit",
+            "apply_patch",
+            "canvas",
+            "nodes",
+            "cron",
+            "process",
+            "sessions_spawn",
+            "date_scout",
+            "flight_scraper",
+            "train_scraper",
+            "train_scout",
+            "find_best_date_combinations",
+            "find_best_train_date_combinations",
+            "consolidate_final_flight_report",
+            "consolidate_final_train_report"
+          ]
+        }
       }
     ]
   },
@@ -165,13 +207,13 @@
     "sessions": {
       "visibility": "all"
     },
-    "agentToAgent": {
-      "enabled": true
-    },
     "loopDetection": {
       "enabled": true,
       "historySize": 5,
       "criticalThreshold": 3
+    },
+    "agentToAgent": {
+      "enabled": true
     }
   },
   "messages": {
@@ -219,14 +261,21 @@
       },
       "travel-train-orchestrator": {
         "enabled": true
+      },
+      "travel-camper": {
+        "enabled": true
       }
     }
   },
   "plugins": {
     "enabled": true,
-    "allow": ["travel-tools"],
+    "allow": [
+      "travel-tools"
+    ],
     "load": {
-      "paths": ["/home/openclaw/.openclaw/extensions/travel-tools"]
+      "paths": [
+        "/home/openclaw/.openclaw/extensions/travel-tools"
+      ]
     }
   }
 }

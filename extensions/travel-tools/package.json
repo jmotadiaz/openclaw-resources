@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/travel-tools",
+  "name": "travel-tools",
   "version": "0.1.0",
   "openclaw": {
     "extensions": [

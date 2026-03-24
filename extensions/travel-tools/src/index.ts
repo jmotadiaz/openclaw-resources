@@ -6,7 +6,9 @@ import { resolveStation } from "./strategies/trenes-com/trenes-com-api";
 import { YescapaStrategy } from "./strategies/yescapa/YescapaStrategy";
 import { CamperScraperStrategy } from "./strategies/CamperScraperStrategy";
 import { resolve } from "path";
+import { readFileSync } from "fs";
 import { FlightDB } from "./utils/db";
+import { logger } from "./utils/logger";
 
 const DB_PATH = resolve(__dirname, "../travel.sqlite");
 
@@ -575,26 +577,24 @@ Do NOT call multiple times for the same session/dates.`,
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: consolidate_final_camper_report
+  // TOOL: fetch_campers_for_analysis
   // ─────────────────────────────────────────────────────────────────────────
   api.registerTool({
-    name: "consolidate_final_camper_report",
-    description: `Retrieves verified camper options from the DB. Never triggers scraping.
-Llama a db.queryCamperOptions() y devuelve los resultados.`,
+    name: "fetch_campers_for_analysis",
+    description: `Retrieves top-N campers per vehicle type for LLM reranking.
+Returns raw camper data including coordinates. Intended to be passed
+to the camper-analyzer subagent, not displayed directly.`,
     parameters: {
       type: "object",
       properties: {
         session_id: { type: "string" },
-        city: { type: "string", description: "Filtrar por ciudad" },
+        city: { type: "string" },
         date_from: { type: "string", description: "YYYY-MM-DD" },
         date_to: { type: "string", description: "YYYY-MM-DD" },
-        limit: { type: "number", description: "Max opciones (default 5)" },
-        sort_by: {
-          type: "string",
-          enum: ["price", "rating", "price_per_day"],
-          default: "price",
+        limit_per_type: {
+          type: "number",
+          description: "Max per vehicle_type (default 10)",
         },
-        sort_dir: { type: "string", enum: ["asc", "desc"], default: "asc" },
       },
       required: ["session_id"],
     },
@@ -606,17 +606,14 @@ Llama a db.queryCamperOptions() y devuelve los resultados.`,
           city: params.city,
           date_from: params.date_from,
           date_to: params.date_to,
-          limit: params.limit || 5,
-          sort_by: params.sort_by || "price",
-          sort_dir: params.sort_dir || "asc",
+          limit: params.limit_per_type ?? 10,
+          group_by_type: true,
+          sort_by: "price",
+          sort_dir: "asc",
         });
         return { status: "success", data: results };
       } catch (error: any) {
-        return {
-          status: "error",
-          reason: "consolidation_failed",
-          message: error.message,
-        };
+        return { status: "error", message: error.message };
       } finally {
         db.close();
       }
@@ -691,31 +688,124 @@ Devuelve el total_count y guarda el JSON completo en disco.`,
         required: ["session_id", "combinations"],
       },
       async execute(_id: string, params: any) {
+        logger.info(`[Tool/camper_scraper] Inciando búsqueda para ${params.combinations.length} combinaciones (Session: ${params.session_id})`);
         const allResults: any[] = [];
         let totalSuccess = 0;
-        let totalError   = 0;
+        let totalError = 0;
 
         for (const s of camperStrategies) {
           const batchResult = await s.strategy.scrapeCampersBatch({
-            session_id:   params.session_id,
+            session_id: params.session_id,
             dbPath,
             combinations: params.combinations,
-            types:        params.types     ?? [],
-            seatbelts:    params.seatbelts ?? null,
-            beds:         params.beds      ?? null,
-            equipment:    params.equipment ?? ['ac', 'shower_int', 'fridge'],
-            page_size:    params.page_size ?? 20
+            types: params.types ?? [],
+            seatbelts: params.seatbelts ?? null,
+            beds: params.beds ?? null,
+            equipment: params.equipment ?? ["ac", "shower_int", "fridge"],
+            page_size: params.page_size ?? 20,
           });
 
-          const mapped = batchResult.results.map(r => ({ site: s.name, ...r }));
+          const mapped = batchResult.results.map((r) => ({
+            site: s.name,
+            ...r,
+          }));
           allResults.push(...mapped);
           totalSuccess += batchResult.summary.success;
-          totalError   += batchResult.summary.error;
+          totalError += batchResult.summary.error;
         }
 
+        logger.info(`[Tool/camper_scraper] Completado: ${totalSuccess} success, ${totalError} error.`);
         return {
-          status:  totalError === 0 ? 'success' : (totalSuccess > 0 ? 'partial' : 'error'),
-          results: allResults
+          status:
+            totalError === 0
+              ? "success"
+              : totalSuccess > 0
+                ? "partial"
+                : "error",
+          results: allResults,
+        };
+      },
+    },
+    { optional: true },
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // TOOL: send_report_email
+  // ─────────────────────────────────────────────────────────────────────────
+  api.registerTool(
+    {
+      name: "send_report_email",
+      description: `Sends a Markdown file as a formatted HTML email via the email service.
+Reads the file at the given absolute path and posts it to the configured
+EMAIL_SERVICE_URL. Use after writing report.md to deliver results to the
+recipient configured in the email service.`,
+      parameters: {
+        type: "object",
+        properties: {
+          file_path: {
+            type: "string",
+            description: "Absolute path to the Markdown file to send.",
+          },
+          subject: {
+            type: "string",
+            description: "Email subject line.",
+          },
+        },
+        required: ["file_path", "subject"],
+      },
+      async execute(_id: string, params: any) {
+        const emailServiceUrl =
+          config.emailServiceUrl ||
+          process.env.EMAIL_SERVICE_URL ||
+          "http://localhost:3000";
+
+        // Read the markdown file
+        let body: string;
+        try {
+          body = readFileSync(params.file_path, "utf-8");
+        } catch (err: any) {
+          return {
+            status: "error",
+            reason: "file_read_failed",
+            message: `Could not read file at "${params.file_path}": ${err.message}`,
+          };
+        }
+
+        // POST to the email service
+        let response: Response;
+        try {
+          response = await fetch(`${emailServiceUrl}/api/email`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ subject: params.subject, body }),
+          });
+        } catch (err: any) {
+          return {
+            status: "error",
+            reason: "email_service_unreachable",
+            message: `Could not reach email service at "${emailServiceUrl}": ${err.message}`,
+          };
+        }
+
+        if (!response.ok) {
+          let detail = "";
+          try {
+            const json = await response.json();
+            detail = json.error ?? JSON.stringify(json);
+          } catch {
+            detail = await response.text();
+          }
+          return {
+            status: "error",
+            reason: "email_service_error",
+            message: `Email service responded ${response.status}: ${detail}`,
+          };
+        }
+
+        const result = await response.json();
+        return {
+          status: "success",
+          messageId: result.messageId,
         };
       },
     },
