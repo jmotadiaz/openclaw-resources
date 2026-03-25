@@ -18,6 +18,7 @@ sessions_spawn(
   agentId: "camper-orchestrator",
   task: "Use the skill travel-camper. CONTEXT: {
     \"session_id\": \"{session_id}\",
+    \"raw_user_query\": \"{raw_user_query}\",
     \"combinations\": [
       { \"city\": \"{destination_city}\", \"date_from\": \"{out_date}\", \"date_to\": \"{ret_date}\" }
     ],

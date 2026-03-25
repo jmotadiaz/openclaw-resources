@@ -29,11 +29,10 @@ export function renderFlightReport(
     lines.push("");
     lines.push(`### 🗓️ Option ${i}: ${key}`);
     lines.push("");
-    lines.push("| # | Airline | Time | Total | Stops |");
-    lines.push("|:---|:---|:---|:---|:---|");
     groups[key].forEach((t, idx) => {
-      const time = `${t.out_dep_time}–${t.out_arr_time}${t.ret_dep_time ? ` / ${t.ret_dep_time}–${t.ret_arr_time}` : ""}`;
-      lines.push(`| ${idx + 1} | ${t.airline} | ${time} | €${t.total_price} | ${t.out_stops} |`);
+      const time = `${t.out_dep_time}–${t.out_arr_time}${t.ret_dep_time ? ` ↔ ${t.ret_dep_time}–${t.ret_arr_time}` : ""}`;
+      lines.push(`${idx + 1}. **${t.airline}** — ${time}`);
+      lines.push(`   - **Precio:** €${t.total_price} | **Escalas:** ${t.out_stops}`);
     });
     if (groups[key][0]?.search_url) {
       lines.push("");

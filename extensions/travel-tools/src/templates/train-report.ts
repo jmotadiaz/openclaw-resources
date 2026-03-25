@@ -61,31 +61,21 @@ export function renderTrainReport(
     lines.push(`#### 🚄 Kayak — Trenes (mejores ${options.length})`);
     lines.push("");
 
-    if (first.ret_date) {
-      lines.push(
-        `| # | Ida | Vuelta | Total (${adults} adultos) | Operador | Cambios |`,
-      );
-      lines.push(`| :--- | :--- | :--- | :--- | :--- | :--- |`);
-      options.forEach((t, i) => {
-        const ida = `${t.out_dep_time}–${t.out_arr_time}`;
+    options.forEach((t, i) => {
+      const ida = `${t.out_dep_time}–${t.out_arr_time}`;
+      if (first.ret_date) {
         const vuelta = t.ret_dep_time
           ? `${t.ret_dep_time}–${t.ret_arr_time}`
           : "—";
-        lines.push(
-          `| ${i + 1} | ${ida} | ${vuelta} | €${t.total_price} | ${t.operator} | ${t.out_changes} |`,
-        );
-      });
-    } else {
+        lines.push(`${i + 1}. **Ida:** ${ida} ↔ **Vuelta:** ${vuelta}`);
+      } else {
+        lines.push(`${i + 1}. **Hora:** ${ida}`);
+      }
+      lines.push(`   - **Precio:** €${t.total_price} (${adults} adultos)`);
       lines.push(
-        `| # | Hora | Total (${adults} adultos) | Operador | Cambios |`,
+        `   - **Operador:** ${t.operator} | **Cambios:** ${t.out_changes}`,
       );
-      lines.push(`| :--- | :--- | :--- | :--- | :--- |`);
-      options.forEach((t, i) => {
-        lines.push(
-          `| ${i + 1} | ${t.out_dep_time}–${t.out_arr_time} | €${t.total_price} | ${t.operator} | ${t.out_changes} |`,
-        );
-      });
-    }
+    });
 
     if (first.search_url) {
       lines.push("");
@@ -102,13 +92,17 @@ export function renderTrainReport(
         `#### 🚐 Campers en ${city} (${first.out_date} → ${first.ret_date ?? first.out_date})`,
       );
       lines.push("");
-      lines.push(`| # | Modelo | Tipo | Camas | €/día | Total | Por qué |`);
-      lines.push(`| :--- | :--- | :--- | :---: | :--- | :--- | :--- |`);
       campers.forEach((c, i) => {
         const name = `[${c.title}](${c.ad_url})`;
         lines.push(
-          `| ${i + 1} | ${name} | ${c.vehicle_type} | ${c.beds} | €${c.price_per_day} | €${c.total_price} | ${c.score_reason ?? ""} |`,
+          `${i + 1}. **${name}** — ${c.vehicle_type} (${c.beds} camas)`,
         );
+        lines.push(
+          `   - **Precio:** €${c.price_per_day}/día (Total: €${c.total_price})`,
+        );
+        if (c.score_reason) {
+          lines.push(`   - **Nota:** ${c.score_reason}`);
+        }
       });
       lines.push("");
     }
