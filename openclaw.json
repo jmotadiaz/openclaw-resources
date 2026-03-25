@@ -98,10 +98,10 @@
         "tools": {
           "allow": [
             "read",
-            "plan_init",
-            "plan_mark",
-            "plan_append_searches",
-            "plan_status",
+            "train_plan_init",
+            "train_plan_mark",
+            "train_plan_append_searches",
+            "train_plan_status",
             "report_build",
             "report_send",
             "date_scout",
@@ -150,7 +150,7 @@
         "name": "camper-orchestrator",
         "workspace": "/home/openclaw/.openclaw/workspace-camper-orchestrator",
         "agentDir": "/home/openclaw/.openclaw/agents/camper-orchestrator",
-        "model": { "primary": "litellm/orchestrator" },
+        "model": { "primary": "litellm/subagent" },
         "sandbox": { "mode": "off" },
         "tools": {
           "allow": [
@@ -166,7 +166,7 @@
             "find_best_date_combinations", "find_best_train_date_combinations",
             "consolidate_final_flight_report", "consolidate_final_train_report",
             "camper_fetch", "camper_store",
-            "plan_init", "plan_mark", "plan_append_searches", "plan_status",
+            "train_plan_init", "train_plan_mark", "train_plan_append_searches", "train_plan_status",
             "report_build", "report_send"
           ]
         }
@@ -213,7 +213,11 @@
     "entries": {
       "mcporter": { "enabled": true },
       "travel-flight-orchestrator": { "enabled": true },
-      "travel-train-orchestrator": { "enabled": true },
+      "travel-train-init": { "enabled": false },
+      "travel-train-scout": { "enabled": true },
+      "travel-train-extract": { "enabled": true },
+      "travel-train-scrape": { "enabled": true },
+      "travel-train-report": { "enabled": true },
       "travel-camper": { "enabled": true }
     }
   },

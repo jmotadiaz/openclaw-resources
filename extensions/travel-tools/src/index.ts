@@ -15,311 +15,12 @@ import {
 } from "./utils/db";
 import { logger } from "./utils/logger";
 import { camperWrite, camperRead, planWrite, planRead } from "./utils/store";
+import { inferNextTrainSkill, inferNextPhase } from "./templates/helpers";
+import { PlanState, renderPlanMarkdown } from "./templates/plan-markdown";
+import { renderTrainReport } from "./templates/train-report";
+import { renderFlightReport } from "./templates/flight-report";
 
 const DB_PATH = resolve(__dirname, "../travel.sqlite");
-
-// ─── Plan state interface ─────────────────────────────────────────────────────
-
-interface PlanState {
-  session_id: string;
-  transport: "flight" | "train";
-  trip_type: "one-way" | "round-trip" | "open-jaw";
-  routes: Array<{ origin: string; destination: string }>;
-  months: string[];
-  constraints: {
-    min_days: number;
-    max_days: number;
-    adults: number;
-    children: number[];
-  };
-  checklist: Array<{ task: string; status: string; note?: string }>;
-  search_checklist: Array<{
-    description: string;
-    status: string;
-    note?: string;
-  }>;
-  created_at: string;
-}
-
-// ─── Report rendering helpers ─────────────────────────────────────────────────
-
-function renderTrainReport(
-  plan: PlanState,
-  rows: TrainQueryResultRow[],
-  camperRows: RankedCamperRow[],
-): string {
-  if (rows.length === 0)
-    return "> ⚠️ No se encontraron opciones de tren en la base de datos.\n";
-
-  const windows = new Map<string, TrainQueryResultRow[]>();
-  for (const row of rows) {
-    const key = `${row.out_date}:${row.ret_date ?? ""}`;
-    if (!windows.has(key)) windows.set(key, []);
-    windows.get(key)!.push(row);
-  }
-
-  // Group campers by date window
-  const campersByWindow = new Map<string, RankedCamperRow[]>();
-  for (const c of camperRows) {
-    const key = `${c.date_from}:${c.date_to}`;
-    if (!campersByWindow.has(key)) campersByWindow.set(key, []);
-    campersByWindow.get(key)!.push(c);
-  }
-
-  const adults = plan.constraints.adults;
-  const lines: string[] = [];
-  let optNum = 0;
-
-  for (const [_key, options] of windows) {
-    optNum++;
-    const first = options[0];
-    const days = first.ret_date
-      ? Math.ceil(
-          (new Date(first.ret_date).getTime() -
-            new Date(first.out_date).getTime()) /
-            86_400_000,
-        )
-      : null;
-
-    // Header
-    if (first.ret_date) {
-      lines.push(
-        `### 🗓️ Opción ${optNum}: ${first.out_date} → ${first.ret_date} (${days} días)`,
-      );
-      lines.push("");
-      lines.push(
-        `**${first.origin.toUpperCase()} ➔ ${first.destination.toUpperCase()} ➔ ${first.origin.toUpperCase()}**`,
-      );
-    } else {
-      lines.push(`### 🗓️ Opción ${optNum}: ${first.out_date} (Solo ida)`);
-      lines.push("");
-      lines.push(
-        `**${first.origin.toUpperCase()} ➔ ${first.destination.toUpperCase()}**`,
-      );
-    }
-    lines.push("");
-
-    // Train table
-    lines.push(`#### 🚄 Kayak — Trenes (mejores ${options.length})`);
-    lines.push("");
-
-    if (first.ret_date) {
-      lines.push(
-        `| # | Ida | Vuelta | Total (${adults} adultos) | Operador | Cambios |`,
-      );
-      lines.push(`| :--- | :--- | :--- | :--- | :--- | :--- |`);
-      options.forEach((t, i) => {
-        const ida = `${t.out_dep_time}–${t.out_arr_time}`;
-        const vuelta = t.ret_dep_time
-          ? `${t.ret_dep_time}–${t.ret_arr_time}`
-          : "—";
-        lines.push(
-          `| ${i + 1} | ${ida} | ${vuelta} | €${t.total_price} | ${t.operator} | ${t.out_changes} |`,
-        );
-      });
-    } else {
-      lines.push(
-        `| # | Hora | Total (${adults} adultos) | Operador | Cambios |`,
-      );
-      lines.push(`| :--- | :--- | :--- | :--- | :--- |`);
-      options.forEach((t, i) => {
-        lines.push(
-          `| ${i + 1} | ${t.out_dep_time}–${t.out_arr_time} | €${t.total_price} | ${t.operator} | ${t.out_changes} |`,
-        );
-      });
-    }
-
-    if (first.search_url) {
-      lines.push("");
-      lines.push(`🔗 [Ver trenes en Kayak](${first.search_url})`);
-    }
-    lines.push("");
-
-    // Camper section — match by out_date:ret_date
-    const camperKey = `${first.out_date}:${first.ret_date ?? first.out_date}`;
-    const campers = campersByWindow.get(camperKey);
-    if (campers && campers.length > 0) {
-      const city = campers[0].city;
-      lines.push(
-        `#### 🚐 Campers en ${city} (${first.out_date} → ${first.ret_date ?? first.out_date})`,
-      );
-      lines.push("");
-      lines.push(`| # | Modelo | Tipo | Camas | €/día | Total | Por qué |`);
-      lines.push(`| :--- | :--- | :--- | :---: | :--- | :--- | :--- |`);
-      campers.forEach((c, i) => {
-        const name = `[${c.title}](${c.ad_url})`;
-        lines.push(
-          `| ${i + 1} | ${name} | ${c.vehicle_type} | ${c.beds} | €${c.price_per_day} | €${c.total_price} | ${c.score_reason ?? ""} |`,
-        );
-      });
-      lines.push("");
-    }
-
-    lines.push("---");
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-function renderFlightReport(plan: PlanState, rows: QueryResultRow[]): string {
-  if (rows.length === 0) return "> ⚠️ No flight options found in database.\n";
-
-  const windows = new Map<string, QueryResultRow[]>();
-  for (const row of rows) {
-    const key = `${row.out_date}:${row.ret_date ?? ""}`;
-    if (!windows.has(key)) windows.set(key, []);
-    windows.get(key)!.push(row);
-  }
-
-  const paxLabel = `${plan.constraints.adults} pax`;
-  const lines: string[] = [];
-  let optNum = 0;
-
-  for (const [_key, allRows] of windows) {
-    optNum++;
-    const first = allRows[0];
-    const days = first.ret_date
-      ? Math.ceil(
-          (new Date(first.ret_date).getTime() -
-            new Date(first.out_date).getTime()) /
-            86_400_000,
-        )
-      : null;
-
-    // Header
-    if (first.ret_date) {
-      lines.push(
-        `### ✈️ Travel Option ${optNum}: ${first.out_date} → ${first.ret_date} (${days} days)`,
-      );
-      lines.push("");
-      lines.push(
-        `**${first.origin.toUpperCase()} ➔ ${first.destination.toUpperCase()} ➔ ${first.origin.toUpperCase()}**`,
-      );
-    } else {
-      lines.push(`### ✈️ Travel Option ${optNum}: ${first.out_date} (One-Way)`);
-      lines.push("");
-      lines.push(
-        `**${first.origin.toUpperCase()} ➔ ${first.destination.toUpperCase()}**`,
-      );
-    }
-    lines.push("");
-
-    // Group by site
-    const bySite = new Map<string, QueryResultRow[]>();
-    for (const row of allRows) {
-      if (!bySite.has(row.site)) bySite.set(row.site, []);
-      bySite.get(row.site)!.push(row);
-    }
-
-    for (const [site, flights] of bySite) {
-      const siteIcon = site === "skyscanner" ? "🟠 Skyscanner" : "🔵 Kayak";
-      const searchUrl = flights[0].search_url ?? "";
-
-      if (first.ret_date) {
-        lines.push(`#### ${siteIcon} — Flights`);
-        lines.push(`| # | Outbound | Return | Total (${paxLabel}) | Airline |`);
-        lines.push(`| :--- | :--- | :--- | :--- | :--- |`);
-        flights.forEach((f, i) => {
-          lines.push(
-            `| ${i + 1} | ${f.out_dep_time}–${f.out_arr_time} | ${f.ret_dep_time ?? ""}–${f.ret_arr_time ?? ""} | €${f.total_price} | ${f.airline} |`,
-          );
-        });
-      } else {
-        lines.push(`#### ${siteIcon} (best ${flights.length})`);
-        lines.push(`| # | Time | Total (${paxLabel}) | Airline |`);
-        lines.push(`| :--- | :--- | :--- | :--- |`);
-        flights.forEach((f, i) => {
-          lines.push(
-            `| ${i + 1} | ${f.out_dep_time}–${f.out_arr_time} | €${f.total_price} | ${f.airline} |`,
-          );
-        });
-      }
-
-      lines.push("");
-      lines.push(
-        `🔗 [View on ${site === "skyscanner" ? "Skyscanner" : "Kayak"}](${searchUrl})`,
-      );
-      lines.push("");
-    }
-
-    lines.push("---");
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-function renderPlanMarkdown(plan: PlanState): string {
-  const lines: string[] = [];
-  const r0 = plan.routes[0];
-  lines.push(`Trip type: ${plan.trip_type}`);
-  lines.push(`Transport: ${plan.transport}`);
-  lines.push(`Outbound:  ${r0.origin} → ${r0.destination}`);
-  if (plan.routes.length > 1) {
-    const r1 = plan.routes[1];
-    lines.push(`Return:    ${r1.origin} → ${r1.destination}`);
-  } else if (plan.trip_type === "round-trip") {
-    lines.push(`Return:    ${r0.destination} → ${r0.origin}`);
-  }
-  lines.push(`Months:    ${plan.months.join(", ")}`);
-  lines.push(
-    `Min days:  ${plan.constraints.min_days} | Max days: ${plan.constraints.max_days}`,
-  );
-  lines.push(
-    `Adults:    ${plan.constraints.adults} | Children: [${plan.constraints.children.join(", ")}]`,
-  );
-  lines.push("");
-  lines.push("Checklist:");
-  for (const item of plan.checklist) {
-    const mark =
-      item.status === "done"
-        ? "x"
-        : item.status === "failed"
-          ? `! FAILED${item.note ? ": " + item.note : ""}`
-          : item.status === "doing"
-            ? "~"
-            : " ";
-    lines.push(`[${mark}] ${item.task}`);
-  }
-  if (plan.search_checklist.length > 0) {
-    lines.push("");
-    lines.push("Search Checklist:");
-    for (const item of plan.search_checklist) {
-      const mark =
-        item.status === "done"
-          ? "x"
-          : item.status === "failed"
-            ? `! FAILED${item.note ? ": " + item.note : ""}`
-            : " ";
-      lines.push(`[${mark}] ${item.description}`);
-    }
-  }
-  return lines.join("\n") + "\n";
-}
-
-function inferNextPhase(plan: PlanState): string {
-  const c = plan.checklist;
-  const sc = plan.search_checklist;
-  const find = (sub: string) =>
-    c.find((i) => i.task.toLowerCase().includes(sub.toLowerCase()));
-
-  const scouting = find("Scouting");
-  const extractor = find("Extractor");
-  const searchCL = find("Search Checklist");
-  const scraping = find("Scraping");
-  const report = find("Final Report");
-
-  if (scouting && scouting.status === "todo") return "Phase 1: Scouting";
-  if (extractor && extractor.status === "todo") return "Phase 2: Extractor";
-  if (searchCL && searchCL.status === "todo")
-    return "Phase 2: Search Checklist";
-  if (sc.some((i) => i.status === "todo")) return "Phase 3: Scraping & Search";
-  if (scraping && scraping.status === "todo")
-    return "Phase 3: Scraping & Search";
-  if (report && report.status === "todo") return "Phase 4: Report";
-  return "Complete";
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TOOL REGISTRATION
@@ -348,9 +49,9 @@ export function register(api: any, config: any = {}) {
   // ═══════════════════════════════════════════════════════════════════════════
 
   api.registerTool({
-    name: "plan_init",
+    name: "train_plan_init",
     description:
-      "Initializes a travel planning session, creates resource directory and initial plan.md.",
+      "Initializes a train travel planning session. Returns next_skill to guide the agent to the next phase.",
     parameters: {
       type: "object",
       required: [
@@ -393,7 +94,11 @@ export function register(api: any, config: any = {}) {
       },
     },
     async execute(_id: string, params: any) {
-      const checklist = [
+      const checklist: Array<{
+        task: string;
+        status: "todo" | "doing" | "done" | "failed";
+        note?: string;
+      }> = [
         { task: "Session Init", status: "done" },
         { task: "Scouting Phase", status: "todo" },
         { task: "Extractor Phase", status: "todo" },
@@ -420,6 +125,7 @@ export function register(api: any, config: any = {}) {
         checklist,
         search_checklist: [],
         created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       };
 
       planWrite(params.session_id, plan);
@@ -428,13 +134,18 @@ export function register(api: any, config: any = {}) {
       mkdirSync(resDir, { recursive: true });
       writeFileSync(`${resDir}/plan.md`, renderPlanMarkdown(plan), "utf8");
 
-      return { status: "success", plan_path: `${resDir}/plan.md` };
+      return {
+        status: "success",
+        next_skill: "travel-train-scout",
+        session_id: params.session_id,
+      };
     },
   });
 
   api.registerTool({
-    name: "plan_mark",
-    description: "Updates status of checklist items and re-renders plan.md.",
+    name: "train_plan_mark",
+    description:
+      "Updates status of checklist items in a train travel plan. Returns next_skill for the next phase.",
     parameters: {
       type: "object",
       required: ["session_id", "items"],
@@ -476,27 +187,27 @@ export function register(api: any, config: any = {}) {
           continue;
         }
         // Check search checklist
-        const search = plan.search_checklist.find((i) =>
+        const search = plan.search_checklist?.find((i) =>
           i.description.toLowerCase().includes(needle),
         );
         if (search) {
           search.status = update.status;
-          if (update.note) search.note = update.note;
         }
       }
 
+      plan.updated_at = new Date().toISOString();
       planWrite(params.session_id, plan);
       const resDir = `/home/openclaw/.openclaw/workspace/resources/${params.session_id}`;
       writeFileSync(`${resDir}/plan.md`, renderPlanMarkdown(plan), "utf8");
 
-      return { status: "success", next_phase: inferNextPhase(plan) };
+      return { status: "success", next_skill: inferNextTrainSkill(plan) };
     },
   });
 
   api.registerTool({
-    name: "plan_append_searches",
+    name: "train_plan_append_searches",
     description:
-      "Appends granular search combinations to the plan's search checklist.",
+      "Appends granular search combinations to the train plan's search checklist. Returns next_skill for the next phase.",
     parameters: {
       type: "object",
       required: ["session_id", "combinations"],
@@ -516,12 +227,15 @@ export function register(api: any, config: any = {}) {
       const plan = planRead(params.session_id) as PlanState | null;
       if (!plan) return { status: "error", message: "Plan not found" };
 
-      for (const combo of params.combinations) {
+      const startId = (plan.search_checklist?.length ?? 0) + 1;
+      params.combinations.forEach((combo: any, idx: number) => {
+        if (!plan.search_checklist) plan.search_checklist = [];
         plan.search_checklist.push({
+          id: startId + idx,
           description: combo.description,
           status: "todo",
         });
-      }
+      });
 
       // Mark "Search Checklist" step as done
       const scItem = plan.checklist.find((i) =>
@@ -529,17 +243,23 @@ export function register(api: any, config: any = {}) {
       );
       if (scItem) scItem.status = "done";
 
+      plan.updated_at = new Date().toISOString();
       planWrite(params.session_id, plan);
       const resDir = `/home/openclaw/.openclaw/workspace/resources/${params.session_id}`;
       writeFileSync(`${resDir}/plan.md`, renderPlanMarkdown(plan), "utf8");
 
-      return { status: "success", count: params.combinations.length };
+      return {
+        status: "success",
+        count: params.combinations.length,
+        next_skill: inferNextTrainSkill(plan),
+      };
     },
   });
 
   api.registerTool({
-    name: "plan_status",
-    description: "Returns a compact summary of the current session state.",
+    name: "train_plan_status",
+    description:
+      "Returns a compact summary of the current train travel session state, including next_skill.",
     parameters: {
       type: "object",
       required: ["session_id"],
@@ -551,7 +271,7 @@ export function register(api: any, config: any = {}) {
 
       const all = [
         ...plan.checklist,
-        ...plan.search_checklist.map((s) => ({
+        ...(plan.search_checklist ?? []).map((s) => ({
           task: s.description,
           status: s.status,
         })),
@@ -561,6 +281,7 @@ export function register(api: any, config: any = {}) {
         transport: plan.transport,
         trip_type: plan.trip_type,
         current_phase: inferNextPhase(plan),
+        next_skill: inferNextTrainSkill(plan),
         done: all.filter((i) => i.status === "done").length,
         failed: all.filter((i) => i.status === "failed").length,
         pending: all.filter((i) => i.status === "todo").length,
@@ -1223,6 +944,10 @@ export function register(api: any, config: any = {}) {
     async execute(_id: string, params: any) {
       const db = new TravelDB(dbPath);
       try {
+        logger.info(
+          "Fetching campers for analysis",
+          JSON.stringify({ params }),
+        );
         const results = db.queryCamperOptionsMulti({
           session_id: params.session_id,
           combinations: params.combinations,
@@ -1231,8 +956,13 @@ export function register(api: any, config: any = {}) {
           sort_by: "price",
           sort_dir: "asc",
         });
+        logger.info(
+          "Fetched campers for analysis",
+          JSON.stringify({ results }),
+        );
         return { status: "success", data: results };
       } catch (error: any) {
+        logger.error("Error fetching campers for analysis", error.message);
         return { status: "error", message: error.message };
       } finally {
         db.close();

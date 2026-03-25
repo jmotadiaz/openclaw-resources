@@ -11,6 +11,43 @@ export function inferNextPhase(plan: PlanState): string {
   return "Phase 3: Scraping";
 }
 
+export function inferNextTrainSkill(plan: PlanState): string | null {
+  const find = (sub: string) =>
+    plan.checklist.find((i) =>
+      i.task.toLowerCase().includes(sub.toLowerCase()),
+    );
+
+  const scouting = find("scouting");
+  if (scouting && scouting.status !== "done" && scouting.status !== "failed")
+    return "travel-train-scout";
+
+  const extractor = find("extractor");
+  if (extractor && extractor.status !== "done" && extractor.status !== "failed")
+    return "travel-train-extract";
+
+  // Check if search_checklist exists and has pending items
+  const searchCL = find("search checklist");
+  if (searchCL && searchCL.status !== "done" && searchCL.status !== "failed")
+    return "travel-train-extract";
+
+  const scraping = find("scraping");
+  if (scraping && scraping.status !== "done" && scraping.status !== "failed") {
+    // If search_checklist has pending items, still in scraping
+    if (
+      plan.search_checklist &&
+      plan.search_checklist.some((i) => i.status === "todo")
+    )
+      return "travel-train-scrape";
+    return "travel-train-scrape";
+  }
+
+  const report = find("final report");
+  if (report && report.status !== "done" && report.status !== "failed")
+    return "travel-train-report";
+
+  return null; // workflow complete
+}
+
 export function groupTrainByDateWindow(rows: TrainQueryResultRow[]): Record<string, TrainQueryResultRow[]> {
   const groups: Record<string, TrainQueryResultRow[]> = {};
   for (const row of rows) {
