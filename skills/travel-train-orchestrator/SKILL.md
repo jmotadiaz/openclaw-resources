@@ -5,71 +5,59 @@ description: Orchestrates a train travel plan by scouting dates via trenes.com, 
 
 ## Workflow
 
-### Phase 0 — Session Setup & Checklist
+### Phase 0 — Session Setup
 
 1. Generate `{session_id}` from timestamp (e.g. `20260313_1325`).
-2. Create `/home/openclaw/.openclaw/workspace/resources/{session_id}/plan.md` using the `write` tool.
-3. Classify the trip type:
+2. Call `plan_init` to initialize the planning state and create the resource directory and `plan.md`.
 
-| User says…                         | Type         | Return scouts needed            |
-| ---------------------------------- | ------------ | ------------------------------- |
-| One destination, no return         | `one-way`    | None                            |
-| Same origin/destination for return | `round-trip` | `destination→origin`            |
-| Return from a different city       | `open-jaw`   | `return_origin→outbound_origin` |
-
-4. Write the user's exact constraints and the initial checklist state into `plan.md`.
+```
+plan_init(
+  session_id: "{session_id}",
+  transport: "train",
+  trip_type: "round-trip",
+  routes: [{ origin: "Madrid", destination: "Sevilla" }],
+  months: ["2026-07"],
+  constraints: {
+    min_days: 2,
+    max_days: 5,
+    adults: 2,
+    children: []
+  }
+)
+```
 
 > ⚠️ Cities must be provided in **Spanish** (e.g. "Madrid", "Sevilla", "Barcelona").
 > ⚠️ Always use `YYYY-MM` for months and `YYYY-MM-DD` for exact dates.
-
-**Full `plan.md` example at the end of Phase 0:**
-
-```
-Trip type: round-trip
-Outbound:  Madrid → Sevilla
-Return:    Sevilla → Madrid
-Months:    2026-07
-Min days:  2 | Max days: 5
-Adults:    2 | Children: []
-
-Checklist:
-[x] Session Init
-[ ] Train Scout Outbound Madrid->Sevilla (2026-07)   ← trenes.com
-[ ] Train Scout Return   Sevilla->Madrid (2026-07)   ← trenes.com
-[ ] Extractor Phase (find_best_train_date_combinations)
-[ ] Search Checklist (appended after Phase 2)
-[ ] Scraping Trains & Campers
-[ ] Final Report
-[ ] Email Report
-```
-
-> ⚠️ For **one-way** trips, omit the return scout line.
 
 ---
 
 ### Phase 1 — Train Date Scouting (parallel) — trenes.com only
 
-Call `train_scout` with city names in Spanish:
+1. Call `train_scout` with city names in Spanish:
 
 ```
 train_scout(
   session_id: "{session_id}",
   routes: [
     { origin_city: "Madrid",  destination_city: "Sevilla", month: "2026-07" },
-    { origin_city: "Sevilla", destination_city: "Madrid",  month: "2026-07" }   ← omit for one-way
+    { origin_city: "Sevilla", destination_city: "Madrid",  month: "2026-07" }
   ]
 )
 ```
 
-Process results and mark checkboxes in `plan.md`.
-
-**🛑 Do not advance to Phase 2 until all Train Scout checkboxes are `[x]` or `[!] FAILED`.**
+2. Update progress:
+```
+plan_mark(
+  session_id: "{session_id}",
+  items: [{ task: "Scout Phase", status: "done" }]
+)
+```
 
 ---
 
 ### Phase 2 — Selecting Best Windows
 
-Call `find_best_train_date_combinations`:
+1. Call `find_best_train_date_combinations`:
 
 ```
 find_best_train_date_combinations(
@@ -83,37 +71,24 @@ find_best_train_date_combinations(
 )
 ```
 
-> For **one-way** trips, omit `return_origin_city` and `return_destination_city`.
-
-Append the **Search Checklist** to `plan.md`. Each combo gets two lines: one for trains (`🚄`) and one for campers (`🚐`). The camper city is always the **train destination** (where the traveller arrives).
-
-**Round-trip example:**
-
+2. Register the resulting combinations in the plan:
 ```
-Search Checklist:
-[ ] Search 1 🚄: Madrid ➔ Sevilla (Out: 2026-07-19) + Sevilla ➔ Madrid (Ret: 2026-07-22)
-[ ] Search 2 🚄: Madrid ➔ Sevilla (Out: 2026-07-03) + Sevilla ➔ Madrid (Ret: 2026-07-06)
-[ ] Search 3 🚄: Madrid ➔ Sevilla (Out: 2026-07-05) + Sevilla ➔ Madrid (Ret: 2026-07-08)
+plan_append_searches(
+  session_id: "{session_id}",
+  combinations: [
+    { description: "Madrid -> Sevilla (2026-07-19) / Sevilla -> Madrid (2026-07-22)" },
+    ...
+  ]
+)
 ```
 
-**Open-jaw example:**
-
+3. Update progress:
 ```
-Search Checklist:
-[ ] Search 1a 🚄: Madrid ➔ Sevilla (Out: 2026-07-19)
-[ ] Search 1b 🚄: Sevilla ➔ Barcelona (Out: 2026-07-22)
-[ ] Search 2a 🚄: Madrid ➔ Sevilla (Out: 2026-07-03)
-[ ] Search 2b 🚄: Sevilla ➔ Barcelona (Out: 2026-07-06)
+plan_mark(
+  session_id: "{session_id}",
+  items: [{ task: "Extractor Phase", status: "done" }]
+)
 ```
-
-**One-way example:**
-
-```
-Search Checklist:
-[ ] Search 1 🚄: Madrid ➔ Sevilla (Out: 2026-07-19)
-```
-
-**🛑 Do not advance to Phase 3 until the Search Checklist is written in `plan.md`.**
 
 ---
 
@@ -121,32 +96,45 @@ Search Checklist:
 
 **CRITICAL ORDER OF EVENTS:**
 
-1. You MUST call `sessions_spawn` tool to delegate the camper search first. **DO NOT read the camper skill directly. YOU MUST DELEGATE.**
-2. **DO NOT yield or wait for the subagent's answer.**
-3. Immediately call `train_scraper` in the next message.
-
-Since `sessions_spawn` is non-blocking, it will return an acceptance status immediately while the subagent works in the background during your train scraping.
+1. **Delegate Camper Search**: Use `sessions_spawn` with `agentId: "camper-orchestrator"`.
+2. **DO NOT wait** for the subagent to finish. Immediately call `train_scraper`.
 
 **Step 1: Camper delegation (non-blocking):**
 
-> ⚠️ **DO NOT READ THE `travel-camper-orchestrator` SKILL YOURSELF. YOU MUST USE THE `sessions_spawn` TOOL!**
-> ⚠️ YOU MUST EXPLICITLY INCLUDE `agentId: "camper-orchestrator"` IN THE TOOL CALL JSON, OTHERWISE IT WILL FAIL. DO NOT OMIT THIS PARAMETER!
+> ⚠️ YOU MUST EXPLICITLY INCLUDE `agentId: "camper-orchestrator"`.
+> ⚠️ The `combinations` in the CONTEXT must use `{ "city", "date_from", "date_to" }` format — NOT the `description` format from plan_append_searches.
+> 🚫 NEVER add a `runtime` parameter — it will cause an error. The only valid params are `agentId`, `task`, and `label`.
+
+The `city` for campers is always the **train destination** (where the traveller arrives).
 
 ```
 sessions_spawn(
   agentId: "camper-orchestrator",
-  task: "Use the skill travel-camper. CONTEXT: [CONTEXT]",
+  task: "Use the skill travel-camper. CONTEXT: {
+    \"session_id\": \"{session_id}\",
+    \"combinations\": [
+      { \"city\": \"{destination_city}\", \"date_from\": \"YYYY-MM-DD\", \"date_to\": \"YYYY-MM-DD\" }
+    ],
+    \"equipment\": [\"ac\", \"shower_int\", \"fridge\"],
+    \"types\": [],
+    \"seatbelts\": {seatbelts},
+    \"beds\": null,
+    \"station\": { \"name\": \"{station_name}\", \"latitude\": {lat}, \"longitude\": {lon} },
+    \"traveller\": { \"adults\": {adults}, \"children\": {children}, \"budget_max\": {budget_max} }
+  }",
   label: "camper-search"
 )
 ```
 
-The [CONTEXT] in the `task` string must be a strictly formatted, stringified JSON object containing:
+**Station coordinates reference:**
 
-- `session_id`: same as the current session
-- `combinations`: array of target cities and dates: `[{ "city": "...", "date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD" }]`
-- `equipment`, `types`, `seatbelts`, `beds`: camper preferences from the user
-- `station`: `{ "name": "...", "latitude": 0.0, "longitude": 0.0 }` (from Coordinates table)
-- `traveller`: `{ "adults": 2, "children": [], "budget_max": 2000 }`
+| City      | Station         | Lat     | Lon     |
+| --------- | --------------- | ------- | ------- |
+| Madrid    | Atocha          | 40.4065 | -3.6895 |
+| Sevilla   | Santa Justa     | 37.3914 | -5.9764 |
+| Barcelona | Sants           | 41.3793 | 2.1403  |
+| Valencia  | Joaquín Sorolla | 39.4651 | -0.3773 |
+| Málaga    | María Zambrano  | 36.7143 | -4.4292 |
 
 **Step 2: Train scraper:**
 
@@ -157,165 +145,58 @@ train_scraper(
   children:   [],
   combinations: [
     { origin: "mad", destination: "svq", exact_date: "2026-07-19", return_date: "2026-07-22" },
-    { origin: "mad", destination: "svq", exact_date: "2026-07-03", return_date: "2026-07-06" }
+    ...
   ]
 )
 ```
 
-After `train_scraper` completes, mark train checkboxes in `plan.md`.
-
-**🛑 Do not advance to Phase 4 until all Train Search Checklist checkboxes are `[x]` or `[!] FAILED`.**
-
----
-
-### Phase 4 — Consolidation and Final Report
-
-#### 4a — Consolidate Trains
-
-Call `consolidate_final_train_report` **exactly once**:
-
+3. Update progress:
 ```
-consolidate_final_train_report(
-  origin:      "mad",
-  destination: "svq",
-  session_id:  "{session_id}",
-  limit:       2,
-  sort_by:     "price",
-  sort_dir:    "asc"
-)
-```
-
-#### 4b — Insert camper results
-
-Si el subagente `camper-orchestrator` aún no ha terminado, haz yield y espera su evento de finalización.
-
-Una vez recibido el evento, llama a `camper_fetch`:
-
-```
-camper_fetch(
+plan_mark(
   session_id: "{session_id}",
-  namespace: "results"
+  items: [
+    { task: "Scraping Phase", status: "done" }
+  ]
 )
 ```
 
-- `status: "success"` → extrae `data.markdown` e insértalo en `report.md` debajo de la sección de trenes de cada opción de fecha.
-- `status: "not_found"` → anota `⚠️ Campers no disponibles` en el report y continúa.
 
-**No uses el resultado del evento de auto-announce** — puede estar truncado por el proxy LLM.
+---
 
-#### 4c — Write the Report
+### Phase 4 — Final Report & Delivery
 
-Write the full report to `report.md` using the `write` tool, then mark `[x] Final Report` in `plan.md`.
-
-#### 4d — Send the Report by Email
-
-Call `send_report_email` with the report path and a descriptive subject:
-
+1. **Trigger Report Generation**: Call `report_build`. This automatically reads all results from DB and renders `report.md`.
 ```
-send_report_email(
-  file_path: "/home/openclaw/.openclaw/workspace/resources/{session_id}/report.md",
-  subject:   "🚄 Informe de viaje — {Origin} → {Destination} ({months})"
+report_build(session_id: "{session_id}")
+```
+
+2. **Send Report**: Call `report_send`.
+```
+report_send(
+  session_id: "{session_id}",
+  subject: "🚄 Informe de viaje — Madrid → Sevilla"
 )
 ```
 
-- On success (`status: "success"`): mark `[x] Email Report` in `plan.md`.
-- On failure (`status: "error"`): mark `[!] Email Report FAILED: {message}` in `plan.md`. **Do not retry** — proceed to the final reply regardless.
-
-Then reply:
-
+3. Update progress:
 ```
-✅ Report ready: `/home/openclaw/.openclaw/workspace/resources/{session_id}/report.md`
+plan_mark(
+  session_id: "{session_id}",
+  items: [
+    { task: "Final Report", status: "done" },
+    { task: "Email Report", status: "done" }
+  ]
+)
 ```
 
-**Nothing else.** No summary, no table, no comments.
-
----
-
-## report.md Format
-
-Each time window gets a single `🗓️ Opción N` block containing trains first, then campers.
-The train URL goes below its table. Each camper row links directly to its listing — no separate camper URL line.
-
----
-
-### Scenario A — One-Way
-
-```markdown
-### 🗓️ Opción [N]: [DATE] (One-Way)
-
-**[Origin City] ➔ [Destination City]**
-
-#### 🚄 Kayak — Trenes (mejores 2)
-
-| #   | Hora    | Total ([ADULTS] adultos) | Operador | Cambios |
-| :-- | :------ | :----------------------- | :------- | :------ |
-| 1   | DEP–ARR | €PRICE                   | OPERATOR | 0       |
-| 2   | DEP–ARR | €PRICE                   | OPERATOR | 0       |
-
-🔗 [Ver trenes en Kayak](https://www.kayak.es/...)
-
-#### 🚐 Campers en [Destination City]
-
-| #   | Modelo                                                   | Tipo       | Camas | €/día | Total |
-| :-- | :------------------------------------------------------- | :--------- | :---: | :---- | :---- |
-| 1   | [Nombre del vehículo](https://www.yescapa.es/campers/ID) | Campervan  |   4   | €115  | €345  |
-| 2   | [Nombre del vehículo](https://www.yescapa.es/campers/ID) | CoachBuilt |   6   | €130  | €390  |
+4. Final reply:
+```
+✅ Report ready in resource directory.
 ```
 
 ---
 
-### Scenario B — Round-Trip
+## Technical Notes
 
-````markdown
-### 🗓️ Opción [N]: [OUT_DATE] → [RET_DATE] ([DAYS] días)
-
-**[Origin City] ➔ [Destination City] ➔ [Origin City]**
-
-#### 🚄 Kayak — Trenes (mejores 2)
-
-| #   | Ida     | Vuelta  | Total ([ADULTS] adultos) | Operador | Cambios |
-| :-- | :------ | :------ | :----------------------- | :------- | :------ |
-| 1   | DEP–ARR | DEP–ARR | €PRICE                   | OPERATOR | 0       |
-| 2   | DEP–ARR | DEP–ARR | €PRICE                   | OPERATOR | 0       |
-
-🔗 [Ver trenes en Kayak](https://www.kayak.es/...)
-
-#### 🚐 Campers en [Destination City] ([OUT_DATE] → [RET_DATE])
-
-| #   | Modelo                                                            | Tipo       | Camas | €/día | Total |
-| :-- | :---------------------------------------------------------------- | :--------- | :---: | :---- | :---- |
-| 1   | [Roller Team Livingstone 5](https://www.yescapa.es/campers/39398) | Campervan  |   4   | €115  | €1320 |
-| 2   | [Benimar Sport 346](https://www.yescapa.es/campers/55887)         | CoachBuilt |   6   | €130  | €1444 |
-
----
-
-### Scenario C — Open-Jaw
-
-```markdown
-### 🗓️ Opción [N]: [OUT_DATE] → [RET_DATE] ([DAYS] días)
-
-**[Origin City] ➔ [Dst City] / [Ret Origin City] ➔ [Ret Dst City]**
-
-#### 🚄 Kayak — Trenes
-
-**Ida: [Origin City] ➔ [Dst City] | [OUT_DATE]**
-| # | Hora | Total ([ADULTS] adultos) | Operador | Cambios |
-| :--- | :--- | :--- | :--- | :--- |
-| 1 | DEP–ARR | €PRICE | OPERATOR | 0 |
-
-🔗 [Ver trenes de ida en Kayak](https://www.kayak.es/...)
-
-**Vuelta: [Ret Origin City] ➔ [Ret Dst City] | [RET_DATE]**
-| # | Hora | Total ([ADULTS] adultos) | Operador | Cambios |
-| :--- | :--- | :--- | :--- | :--- |
-| 1 | DEP–ARR | €PRICE | OPERATOR | 0 |
-
-🔗 [Ver trenes de vuelta en Kayak](https://www.kayak.es/...)
-
-#### 🚐 Campers en [Dst City] ([OUT_DATE] → [RET_DATE])
-
-| #   | Modelo                                                   | Tipo      | Camas | €/día | Total |
-| :-- | :------------------------------------------------------- | :-------- | :---: | :---- | :---- |
-| 1   | [Nombre del vehículo](https://www.yescapa.es/campers/ID) | Campervan |   4   | €115  | €1320 |
-```
-````
+- The `main` agent has **READ-ONLY** access to the filesystem. NEVER use `write` or `edit` tools on `plan.md` or `report.md`. Use the specialized tools (`plan_init`, `plan_mark`, `plan_append_searches`, `report_build`).
+- All state is managed internally by the extension.

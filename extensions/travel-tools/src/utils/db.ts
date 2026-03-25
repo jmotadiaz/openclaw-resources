@@ -12,13 +12,13 @@ export interface FlightScoutRecord {
 
 export interface TrainScoutRecord {
   session_id: string;
-  site: string; // 'trenes_com'
+  site: string;
   origin_city: string;
   origin_id: string;
   destination_city: string;
   destination_id: string;
-  month: string; // 'YYYY-MM'
-  date: string; // 'YYYY-MM-DD'
+  month: string;
+  date: string;
   price: number;
 }
 
@@ -36,8 +36,8 @@ export interface ItineraryRecord {
 export interface FlightOptionRecord {
   airline: string;
   total_price: number;
-  out_dep_time: string; // "HH:MM"
-  out_arr_time: string; // "HH:MM"
+  out_dep_time: string;
+  out_arr_time: string;
   out_duration?: string | null;
   out_stops: number;
   ret_dep_time?: string | null;
@@ -121,13 +121,13 @@ export interface QueryResultRow {
 
 export interface TrainItineraryRecord {
   session_id: string;
-  site: string; // 'kayak_train'
-  origin: string; // station code (lowercase)
+  site: string;
+  origin: string;
   destination: string;
-  out_date: string; // YYYY-MM-DD
+  out_date: string;
   ret_date?: string | null;
   adults: number;
-  children?: number[]; // ages, stored as JSON
+  children?: number[];
   search_url?: string | null;
 }
 
@@ -169,7 +169,7 @@ export interface TrainQueryResultRow {
   out_date: string;
   ret_date: string | null;
   adults: number;
-  children: string | null; // JSON
+  children: string | null;
   search_url: string | null;
   scraped_at: string;
   option_id: number;
@@ -216,8 +216,8 @@ export interface CamperOptionRecord {
   instant_booking: boolean;
   rating: number | null;
   rating_count: number;
-  latitude: number | null; // ← nuevo
-  longitude: number | null; // ← nuevo
+  latitude: number | null;
+  longitude: number | null;
 }
 
 export interface CamperQueryParams {
@@ -228,18 +228,15 @@ export interface CamperQueryParams {
   sort_by?: "price" | "rating" | "price_per_day";
   sort_dir?: "asc" | "desc";
   limit?: number;
-  group_by_type?: boolean; // ← nuevo
+  group_by_type?: boolean;
 }
 
-// Nueva interfaz — output mínimo para análisis LLM
 export interface CamperAnalysisRow {
-  // de camper_itineraries
   session_id: string;
   city: string;
   date_from: string;
   date_to: string;
   search_url: string;
-  // de camper_options
   option_id: number;
   camper_id: number;
   ad_url: string;
@@ -249,11 +246,32 @@ export interface CamperAnalysisRow {
   beds: number;
   price_per_day: number;
   total_price: number;
-  instant_booking: number; // 0 | 1
+  instant_booking: number;
   rating: number | null;
   rating_count: number;
   latitude: number | null;
   longitude: number | null;
+}
+
+// ─── Ranked camper interface (NEW) ────────────────────────────────────────────
+
+export interface RankedCamperRow {
+  city: string;
+  date_from: string;
+  date_to: string;
+  rank: number;
+  score: number;
+  score_reason: string | null;
+  station_dist_km: number | null;
+  title: string;
+  ad_url: string;
+  vehicle_type: string;
+  beds: number;
+  price_per_day: number;
+  total_price: number;
+  instant_booking: number;
+  rating: number | null;
+  rating_count: number;
 }
 
 export class TravelDB {
@@ -424,8 +442,25 @@ export class TravelDB {
       CREATE INDEX IF NOT EXISTS idx_co_price ON camper_options(itinerary_id, total_price);
       CREATE INDEX IF NOT EXISTS idx_co_type_price
         ON camper_options(itinerary_id, vehicle_type, total_price);
+
+      CREATE TABLE IF NOT EXISTS ranked_campers (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id      TEXT    NOT NULL,
+        city            TEXT    NOT NULL,
+        date_from       TEXT    NOT NULL,
+        date_to         TEXT    NOT NULL,
+        option_id       INTEGER NOT NULL,
+        rank            INTEGER NOT NULL,
+        score           REAL    NOT NULL,
+        score_reason    TEXT,
+        station_dist_km REAL,
+        created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(session_id, city, date_from, date_to, option_id)
+      );
     `);
   }
+
+  // ─── Flight scouts ──────────────────────────────────────────────────────────
 
   insertScout(record: FlightScoutRecord) {
     const stmt = this.db.prepare(`
@@ -453,6 +488,8 @@ export class TravelDB {
     `);
     return stmt.all(origin, destination, ...months) as FlightScoutRecord[];
   }
+
+  // ─── Train scouts ──────────────────────────────────────────────────────────
 
   insertTrainScout(record: TrainScoutRecord): void {
     this.db
@@ -495,6 +532,8 @@ export class TravelDB {
       .all(originId, destinationId, ...months) as TrainScoutRecord[];
   }
 
+  // ─── Flight itineraries + options ───────────────────────────────────────────
+
   upsertItinerary(rec: ItineraryRecord): number {
     this.db
       .prepare(
@@ -523,12 +562,8 @@ export class TravelDB {
       .prepare(
         `
       SELECT id FROM itineraries
-      WHERE session_id = ?
-        AND site = ?
-        AND origin = ?
-        AND destination = ?
-        AND out_date = ?
-        AND ret_date IS ?
+      WHERE session_id = ? AND site = ? AND origin = ? AND destination = ?
+        AND out_date = ? AND ret_date IS ?
     `,
       )
       .get(
@@ -571,46 +606,63 @@ export class TravelDB {
       );
   }
 
+  // ── CHANGED: added session-only fallback ────────────────────────────────────
   queryFlightOptions(params: FlightQueryParams): QueryResultRow[] {
     const optionsPerItinerary = params.limit ?? 3;
-    let itinIds: number[] = [];
+    let itinIds: number[];
 
-    const legs =
-      params.legs && params.legs.length > 0
-        ? params.legs
-        : params.origin && params.destination
-          ? [{ origin: params.origin, destination: params.destination }]
-          : (() => {
-              throw new Error(
-                "queryFlightOptions: provide either origin+destination or legs[]",
-              );
-            })();
-
-    const legConditions = legs
-      .map(() => `(origin = ? AND destination = ?)`)
-      .join(" OR ");
-    const itinQ = `
-      SELECT id FROM itineraries
-      WHERE session_id = ?
-      AND (${legConditions})
-      ${params.site ? "AND site = ?" : ""}
-      ${params.out_date ? "AND out_date = ?" : ""}
-      ${params.ret_date ? "AND ret_date IS ?" : ""}
-    `;
-    const itinP: any[] = [
-      params.session_id,
-      ...legs.flatMap((l) => [
-        l.origin.toLowerCase(),
-        l.destination.toLowerCase(),
-      ]),
-      ...(params.site ? [params.site] : []),
-      ...(params.out_date ? [params.out_date] : []),
-      ...(params.ret_date ? [params.ret_date] : []),
-    ];
-
-    itinIds = (this.db.prepare(itinQ).all(...itinP) as { id: number }[]).map(
-      (r) => r.id,
-    );
+    if (params.legs && params.legs.length > 0) {
+      const legConditions = params.legs
+        .map(() => `(origin = ? AND destination = ?)`)
+        .join(" OR ");
+      const itinP: any[] = [
+        params.session_id,
+        ...params.legs.flatMap((l) => [
+          l.origin.toLowerCase(),
+          l.destination.toLowerCase(),
+        ]),
+        ...(params.site ? [params.site] : []),
+        ...(params.out_date ? [params.out_date] : []),
+        ...(params.ret_date ? [params.ret_date] : []),
+      ];
+      const itinQ = `
+        SELECT id FROM itineraries
+        WHERE session_id = ? AND (${legConditions})
+        ${params.site ? "AND site = ?" : ""}
+        ${params.out_date ? "AND out_date = ?" : ""}
+        ${params.ret_date ? "AND ret_date IS ?" : ""}
+      `;
+      itinIds = (this.db.prepare(itinQ).all(...itinP) as { id: number }[]).map(
+        (r) => r.id,
+      );
+    } else if (params.origin && params.destination) {
+      const itinP: any[] = [
+        params.session_id,
+        params.origin.toLowerCase(),
+        params.destination.toLowerCase(),
+        ...(params.site ? [params.site] : []),
+        ...(params.out_date ? [params.out_date] : []),
+        ...(params.ret_date ? [params.ret_date] : []),
+      ];
+      const itinQ = `
+        SELECT id FROM itineraries
+        WHERE session_id = ? AND origin = ? AND destination = ?
+        ${params.site ? "AND site = ?" : ""}
+        ${params.out_date ? "AND out_date = ?" : ""}
+        ${params.ret_date ? "AND ret_date IS ?" : ""}
+      `;
+      itinIds = (this.db.prepare(itinQ).all(...itinP) as { id: number }[]).map(
+        (r) => r.id,
+      );
+    } else {
+      // ← NEW: session-only mode — report_build uses this
+      const itinP: any[] = [params.session_id];
+      itinIds = (
+        this.db
+          .prepare(`SELECT id FROM itineraries WHERE session_id = ?`)
+          .all(...itinP) as { id: number }[]
+      ).map((r) => r.id);
+    }
 
     if (itinIds.length === 0) return [];
 
@@ -683,6 +735,8 @@ export class TravelDB {
     return this.db.prepare(wrapped).all(...foP) as QueryResultRow[];
   }
 
+  // ─── Date combination extraction ────────────────────────────────────────────
+
   extractDateCombinations(params: {
     origin: string;
     destination: string;
@@ -733,7 +787,6 @@ export class TravelDB {
       );
 
     const combinations: CombinationResult[] = [];
-
     for (const out of outDates) {
       for (const ret of retDates) {
         const diffDays = Math.ceil(
@@ -759,7 +812,6 @@ export class TravelDB {
         }
       }
     }
-
     return combinations
       .sort((a, b) => a.total_price - b.total_price)
       .slice(0, params.top);
@@ -814,7 +866,6 @@ export class TravelDB {
       );
 
     const combinations: TrainCombinationResult[] = [];
-
     for (const out of outDates) {
       for (const ret of retDates) {
         const diffDays = Math.ceil(
@@ -842,7 +893,6 @@ export class TravelDB {
         }
       }
     }
-
     return combinations
       .sort((a, b) => a.total_price - b.total_price)
       .slice(0, params.top);
@@ -879,12 +929,8 @@ export class TravelDB {
       .prepare(
         `
       SELECT id FROM train_itineraries
-      WHERE session_id = ?
-        AND site = ?
-        AND origin = ?
-        AND destination = ?
-        AND out_date = ?
-        AND ret_date IS ?
+      WHERE session_id = ? AND site = ? AND origin = ? AND destination = ?
+        AND out_date = ? AND ret_date IS ?
     `,
       )
       .get(
@@ -929,44 +975,63 @@ export class TravelDB {
       );
   }
 
+  // ── CHANGED: added session-only fallback ────────────────────────────────────
   queryTrainOptions(params: TrainQueryParams): TrainQueryResultRow[] {
     const optionsPerItinerary = params.limit ?? 3;
-    const legs =
-      params.legs && params.legs.length > 0
-        ? params.legs
-        : params.origin && params.destination
-          ? [{ origin: params.origin, destination: params.destination }]
-          : (() => {
-              throw new Error(
-                "queryTrainOptions: provide either origin+destination or legs[]",
-              );
-            })();
+    let itinIds: number[];
 
-    const legConditions = legs
-      .map(() => `(origin = ? AND destination = ?)`)
-      .join(" OR ");
-    const itinQ = `
-      SELECT id FROM train_itineraries
-      WHERE session_id = ?
-      AND (${legConditions})
-      ${params.site ? "AND site = ?" : ""}
-      ${params.out_date ? "AND out_date = ?" : ""}
-      ${params.ret_date ? "AND ret_date IS ?" : ""}
-    `;
-    const itinP: any[] = [
-      params.session_id,
-      ...legs.flatMap((l) => [
-        l.origin.toLowerCase(),
-        l.destination.toLowerCase(),
-      ]),
-      ...(params.site ? [params.site] : []),
-      ...(params.out_date ? [params.out_date] : []),
-      ...(params.ret_date ? [params.ret_date] : []),
-    ];
-
-    const itinIds = (
-      this.db.prepare(itinQ).all(...itinP) as { id: number }[]
-    ).map((r) => r.id);
+    if (params.legs && params.legs.length > 0) {
+      const legConditions = params.legs
+        .map(() => `(origin = ? AND destination = ?)`)
+        .join(" OR ");
+      const itinP: any[] = [
+        params.session_id,
+        ...params.legs.flatMap((l) => [
+          l.origin.toLowerCase(),
+          l.destination.toLowerCase(),
+        ]),
+        ...(params.site ? [params.site] : []),
+        ...(params.out_date ? [params.out_date] : []),
+        ...(params.ret_date ? [params.ret_date] : []),
+      ];
+      const itinQ = `
+        SELECT id FROM train_itineraries
+        WHERE session_id = ? AND (${legConditions})
+        ${params.site ? "AND site = ?" : ""}
+        ${params.out_date ? "AND out_date = ?" : ""}
+        ${params.ret_date ? "AND ret_date IS ?" : ""}
+      `;
+      itinIds = (this.db.prepare(itinQ).all(...itinP) as { id: number }[]).map(
+        (r) => r.id,
+      );
+    } else if (params.origin && params.destination) {
+      const itinP: any[] = [
+        params.session_id,
+        params.origin.toLowerCase(),
+        params.destination.toLowerCase(),
+        ...(params.site ? [params.site] : []),
+        ...(params.out_date ? [params.out_date] : []),
+        ...(params.ret_date ? [params.ret_date] : []),
+      ];
+      const itinQ = `
+        SELECT id FROM train_itineraries
+        WHERE session_id = ? AND origin = ? AND destination = ?
+        ${params.site ? "AND site = ?" : ""}
+        ${params.out_date ? "AND out_date = ?" : ""}
+        ${params.ret_date ? "AND ret_date IS ?" : ""}
+      `;
+      itinIds = (this.db.prepare(itinQ).all(...itinP) as { id: number }[]).map(
+        (r) => r.id,
+      );
+    } else {
+      // ← NEW: session-only mode — report_build uses this
+      const itinP: any[] = [params.session_id];
+      itinIds = (
+        this.db
+          .prepare(`SELECT id FROM train_itineraries WHERE session_id = ?`)
+          .all(...itinP) as { id: number }[]
+      ).map((r) => r.id);
+    }
 
     if (itinIds.length === 0) return [];
 
@@ -1124,14 +1189,12 @@ export class TravelDB {
           ? "price_per_day"
           : "total_price";
     const orderDir = params.sort_dir === "desc" ? "DESC" : "ASC";
-
     const partition = params.group_by_type
       ? "PARTITION BY session_id, city, date_from, date_to, vehicle_type"
       : "PARTITION BY session_id, city, date_from, date_to";
 
     let filters = `ci.session_id = ?`;
     const p: any[] = [params.session_id];
-
     if (params.city) {
       filters += ` AND ci.city = ?`;
       p.push(params.city);
@@ -1147,26 +1210,19 @@ export class TravelDB {
 
     const q = `
       WITH filtered AS (
-        SELECT
-          ci.session_id, ci.city, ci.date_from, ci.date_to, ci.search_url,
+        SELECT ci.session_id, ci.city, ci.date_from, ci.date_to, ci.search_url,
           co.id AS option_id, co.camper_id, co.ad_url, co.title, co.vehicle_type,
           co.seats, co.beds, co.price_per_day, co.total_price, co.instant_booking,
           co.rating, co.rating_count, co.latitude, co.longitude
-        FROM camper_options co
-        JOIN camper_itineraries ci ON ci.id = co.itinerary_id
+        FROM camper_options co JOIN camper_itineraries ci ON ci.id = co.itinerary_id
         WHERE ${filters}
       ),
       ranked AS (
-        SELECT *,
-          ROW_NUMBER() OVER (
-            ${partition}
-            ORDER BY ${orderCol} ${orderDir}
-          ) AS rn
+        SELECT *, ROW_NUMBER() OVER (${partition} ORDER BY ${orderCol} ${orderDir}) AS rn
         FROM filtered
       )
       SELECT * FROM ranked WHERE rn <= ?
     `;
-
     p.push(limit);
     return this.db.prepare(q).all(...p) as CamperAnalysisRow[];
   }
@@ -1186,7 +1242,6 @@ export class TravelDB {
           ? "price_per_day"
           : "total_price";
     const orderDir = params.sort_dir === "desc" ? "DESC" : "ASC";
-
     const partition = params.group_by_type
       ? "PARTITION BY city, date_from, date_to, vehicle_type"
       : "PARTITION BY city, date_from, date_to";
@@ -1199,29 +1254,77 @@ export class TravelDB {
 
     const q = `
       WITH filtered AS (
-        SELECT
-          ci.session_id, ci.city, ci.date_from, ci.date_to, ci.search_url,
+        SELECT ci.session_id, ci.city, ci.date_from, ci.date_to, ci.search_url,
           co.id AS option_id, co.camper_id, co.ad_url, co.title, co.vehicle_type,
           co.seats, co.beds, co.price_per_day, co.total_price, co.instant_booking,
           co.rating, co.rating_count, co.latitude, co.longitude
-        FROM camper_options co
-        JOIN camper_itineraries ci ON ci.id = co.itinerary_id
-        WHERE ci.session_id = ?
-          AND (${clauses.join(" OR ")})
+        FROM camper_options co JOIN camper_itineraries ci ON ci.id = co.itinerary_id
+        WHERE ci.session_id = ? AND (${clauses.join(" OR ")})
       ),
       ranked AS (
-        SELECT *,
-          ROW_NUMBER() OVER (
-            ${partition}
-            ORDER BY ${orderCol} ${orderDir}
-          ) AS rn
+        SELECT *, ROW_NUMBER() OVER (${partition} ORDER BY ${orderCol} ${orderDir}) AS rn
         FROM filtered
       )
       SELECT * FROM ranked WHERE rn <= ?
     `;
-
     p.push(params.limit);
     return this.db.prepare(q).all(...p) as CamperAnalysisRow[];
+  }
+
+  // ─── Ranked campers (NEW) ──────────────────────────────────────────────────
+
+  upsertRankedCamper(params: {
+    session_id: string;
+    city: string;
+    date_from: string;
+    date_to: string;
+    option_id: number;
+    rank: number;
+    score: number;
+    score_reason?: string;
+    station_dist_km?: number;
+  }): void {
+    this.db
+      .prepare(
+        `
+      INSERT INTO ranked_campers
+        (session_id, city, date_from, date_to, option_id, rank, score, score_reason, station_dist_km)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, city, date_from, date_to, option_id)
+      DO UPDATE SET rank = excluded.rank, score = excluded.score,
+        score_reason = excluded.score_reason, station_dist_km = excluded.station_dist_km
+    `,
+      )
+      .run(
+        params.session_id,
+        params.city,
+        params.date_from,
+        params.date_to,
+        params.option_id,
+        params.rank,
+        params.score,
+        params.score_reason ?? null,
+        params.station_dist_km ?? null,
+      );
+  }
+
+  getRankedCampers(session_id: string): RankedCamperRow[] {
+    return this.db
+      .prepare(
+        `
+      SELECT
+        rc.city, rc.date_from, rc.date_to,
+        rc.rank, rc.score, rc.score_reason, rc.station_dist_km,
+        co.title, co.ad_url, co.vehicle_type, co.beds,
+        co.price_per_day, co.total_price, co.instant_booking,
+        co.rating, co.rating_count
+      FROM ranked_campers rc
+      JOIN camper_options co ON co.id = rc.option_id
+      WHERE rc.session_id = ?
+      ORDER BY rc.city, rc.date_from, rc.rank
+    `,
+      )
+      .all(session_id) as RankedCamperRow[];
   }
 
   // ─── Error logging ──────────────────────────────────────────────────────────
@@ -1233,17 +1336,19 @@ export class TravelDB {
     error: string,
     context?: any,
   ) {
-    const stmt = this.db.prepare(`
-      INSERT INTO errors (site, session_id, tool, error, context)
-      VALUES (?, ?, ?, ?, ?)
-    `);
-    return stmt.run(
-      site,
-      session_id,
-      tool,
-      error,
-      context ? JSON.stringify(context) : null,
-    );
+    this.db
+      .prepare(
+        `
+      INSERT INTO errors (site, session_id, tool, error, context) VALUES (?, ?, ?, ?, ?)
+    `,
+      )
+      .run(
+        site,
+        session_id,
+        tool,
+        error,
+        context ? JSON.stringify(context) : null,
+      );
   }
 
   close() {

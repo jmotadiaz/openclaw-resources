@@ -6,17 +6,328 @@ import { resolveStation } from "./strategies/trenes-com/trenes-com-api";
 import { YescapaStrategy } from "./strategies/yescapa/YescapaStrategy";
 import { CamperScraperStrategy } from "./strategies/CamperScraperStrategy";
 import { resolve } from "path";
-import { readFileSync } from "fs";
-import { TravelDB } from "./utils/db";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
+import {
+  TravelDB,
+  QueryResultRow,
+  TrainQueryResultRow,
+  RankedCamperRow,
+} from "./utils/db";
 import { logger } from "./utils/logger";
-import { camperWrite, camperRead } from "./utils/store";
+import { camperWrite, camperRead, planWrite, planRead } from "./utils/store";
 
 const DB_PATH = resolve(__dirname, "../travel.sqlite");
+
+// ─── Plan state interface ─────────────────────────────────────────────────────
+
+interface PlanState {
+  session_id: string;
+  transport: "flight" | "train";
+  trip_type: "one-way" | "round-trip" | "open-jaw";
+  routes: Array<{ origin: string; destination: string }>;
+  months: string[];
+  constraints: {
+    min_days: number;
+    max_days: number;
+    adults: number;
+    children: number[];
+  };
+  checklist: Array<{ task: string; status: string; note?: string }>;
+  search_checklist: Array<{
+    description: string;
+    status: string;
+    note?: string;
+  }>;
+  created_at: string;
+}
+
+// ─── Report rendering helpers ─────────────────────────────────────────────────
+
+function renderTrainReport(
+  plan: PlanState,
+  rows: TrainQueryResultRow[],
+  camperRows: RankedCamperRow[],
+): string {
+  if (rows.length === 0)
+    return "> ⚠️ No se encontraron opciones de tren en la base de datos.\n";
+
+  const windows = new Map<string, TrainQueryResultRow[]>();
+  for (const row of rows) {
+    const key = `${row.out_date}:${row.ret_date ?? ""}`;
+    if (!windows.has(key)) windows.set(key, []);
+    windows.get(key)!.push(row);
+  }
+
+  // Group campers by date window
+  const campersByWindow = new Map<string, RankedCamperRow[]>();
+  for (const c of camperRows) {
+    const key = `${c.date_from}:${c.date_to}`;
+    if (!campersByWindow.has(key)) campersByWindow.set(key, []);
+    campersByWindow.get(key)!.push(c);
+  }
+
+  const adults = plan.constraints.adults;
+  const lines: string[] = [];
+  let optNum = 0;
+
+  for (const [_key, options] of windows) {
+    optNum++;
+    const first = options[0];
+    const days = first.ret_date
+      ? Math.ceil(
+          (new Date(first.ret_date).getTime() -
+            new Date(first.out_date).getTime()) /
+            86_400_000,
+        )
+      : null;
+
+    // Header
+    if (first.ret_date) {
+      lines.push(
+        `### 🗓️ Opción ${optNum}: ${first.out_date} → ${first.ret_date} (${days} días)`,
+      );
+      lines.push("");
+      lines.push(
+        `**${first.origin.toUpperCase()} ➔ ${first.destination.toUpperCase()} ➔ ${first.origin.toUpperCase()}**`,
+      );
+    } else {
+      lines.push(`### 🗓️ Opción ${optNum}: ${first.out_date} (Solo ida)`);
+      lines.push("");
+      lines.push(
+        `**${first.origin.toUpperCase()} ➔ ${first.destination.toUpperCase()}**`,
+      );
+    }
+    lines.push("");
+
+    // Train table
+    lines.push(`#### 🚄 Kayak — Trenes (mejores ${options.length})`);
+    lines.push("");
+
+    if (first.ret_date) {
+      lines.push(
+        `| # | Ida | Vuelta | Total (${adults} adultos) | Operador | Cambios |`,
+      );
+      lines.push(`| :--- | :--- | :--- | :--- | :--- | :--- |`);
+      options.forEach((t, i) => {
+        const ida = `${t.out_dep_time}–${t.out_arr_time}`;
+        const vuelta = t.ret_dep_time
+          ? `${t.ret_dep_time}–${t.ret_arr_time}`
+          : "—";
+        lines.push(
+          `| ${i + 1} | ${ida} | ${vuelta} | €${t.total_price} | ${t.operator} | ${t.out_changes} |`,
+        );
+      });
+    } else {
+      lines.push(
+        `| # | Hora | Total (${adults} adultos) | Operador | Cambios |`,
+      );
+      lines.push(`| :--- | :--- | :--- | :--- | :--- |`);
+      options.forEach((t, i) => {
+        lines.push(
+          `| ${i + 1} | ${t.out_dep_time}–${t.out_arr_time} | €${t.total_price} | ${t.operator} | ${t.out_changes} |`,
+        );
+      });
+    }
+
+    if (first.search_url) {
+      lines.push("");
+      lines.push(`🔗 [Ver trenes en Kayak](${first.search_url})`);
+    }
+    lines.push("");
+
+    // Camper section — match by out_date:ret_date
+    const camperKey = `${first.out_date}:${first.ret_date ?? first.out_date}`;
+    const campers = campersByWindow.get(camperKey);
+    if (campers && campers.length > 0) {
+      const city = campers[0].city;
+      lines.push(
+        `#### 🚐 Campers en ${city} (${first.out_date} → ${first.ret_date ?? first.out_date})`,
+      );
+      lines.push("");
+      lines.push(`| # | Modelo | Tipo | Camas | €/día | Total | Por qué |`);
+      lines.push(`| :--- | :--- | :--- | :---: | :--- | :--- | :--- |`);
+      campers.forEach((c, i) => {
+        const name = `[${c.title}](${c.ad_url})`;
+        lines.push(
+          `| ${i + 1} | ${name} | ${c.vehicle_type} | ${c.beds} | €${c.price_per_day} | €${c.total_price} | ${c.score_reason ?? ""} |`,
+        );
+      });
+      lines.push("");
+    }
+
+    lines.push("---");
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+function renderFlightReport(plan: PlanState, rows: QueryResultRow[]): string {
+  if (rows.length === 0) return "> ⚠️ No flight options found in database.\n";
+
+  const windows = new Map<string, QueryResultRow[]>();
+  for (const row of rows) {
+    const key = `${row.out_date}:${row.ret_date ?? ""}`;
+    if (!windows.has(key)) windows.set(key, []);
+    windows.get(key)!.push(row);
+  }
+
+  const paxLabel = `${plan.constraints.adults} pax`;
+  const lines: string[] = [];
+  let optNum = 0;
+
+  for (const [_key, allRows] of windows) {
+    optNum++;
+    const first = allRows[0];
+    const days = first.ret_date
+      ? Math.ceil(
+          (new Date(first.ret_date).getTime() -
+            new Date(first.out_date).getTime()) /
+            86_400_000,
+        )
+      : null;
+
+    // Header
+    if (first.ret_date) {
+      lines.push(
+        `### ✈️ Travel Option ${optNum}: ${first.out_date} → ${first.ret_date} (${days} days)`,
+      );
+      lines.push("");
+      lines.push(
+        `**${first.origin.toUpperCase()} ➔ ${first.destination.toUpperCase()} ➔ ${first.origin.toUpperCase()}**`,
+      );
+    } else {
+      lines.push(`### ✈️ Travel Option ${optNum}: ${first.out_date} (One-Way)`);
+      lines.push("");
+      lines.push(
+        `**${first.origin.toUpperCase()} ➔ ${first.destination.toUpperCase()}**`,
+      );
+    }
+    lines.push("");
+
+    // Group by site
+    const bySite = new Map<string, QueryResultRow[]>();
+    for (const row of allRows) {
+      if (!bySite.has(row.site)) bySite.set(row.site, []);
+      bySite.get(row.site)!.push(row);
+    }
+
+    for (const [site, flights] of bySite) {
+      const siteIcon = site === "skyscanner" ? "🟠 Skyscanner" : "🔵 Kayak";
+      const searchUrl = flights[0].search_url ?? "";
+
+      if (first.ret_date) {
+        lines.push(`#### ${siteIcon} — Flights`);
+        lines.push(`| # | Outbound | Return | Total (${paxLabel}) | Airline |`);
+        lines.push(`| :--- | :--- | :--- | :--- | :--- |`);
+        flights.forEach((f, i) => {
+          lines.push(
+            `| ${i + 1} | ${f.out_dep_time}–${f.out_arr_time} | ${f.ret_dep_time ?? ""}–${f.ret_arr_time ?? ""} | €${f.total_price} | ${f.airline} |`,
+          );
+        });
+      } else {
+        lines.push(`#### ${siteIcon} (best ${flights.length})`);
+        lines.push(`| # | Time | Total (${paxLabel}) | Airline |`);
+        lines.push(`| :--- | :--- | :--- | :--- |`);
+        flights.forEach((f, i) => {
+          lines.push(
+            `| ${i + 1} | ${f.out_dep_time}–${f.out_arr_time} | €${f.total_price} | ${f.airline} |`,
+          );
+        });
+      }
+
+      lines.push("");
+      lines.push(
+        `🔗 [View on ${site === "skyscanner" ? "Skyscanner" : "Kayak"}](${searchUrl})`,
+      );
+      lines.push("");
+    }
+
+    lines.push("---");
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+function renderPlanMarkdown(plan: PlanState): string {
+  const lines: string[] = [];
+  const r0 = plan.routes[0];
+  lines.push(`Trip type: ${plan.trip_type}`);
+  lines.push(`Transport: ${plan.transport}`);
+  lines.push(`Outbound:  ${r0.origin} → ${r0.destination}`);
+  if (plan.routes.length > 1) {
+    const r1 = plan.routes[1];
+    lines.push(`Return:    ${r1.origin} → ${r1.destination}`);
+  } else if (plan.trip_type === "round-trip") {
+    lines.push(`Return:    ${r0.destination} → ${r0.origin}`);
+  }
+  lines.push(`Months:    ${plan.months.join(", ")}`);
+  lines.push(
+    `Min days:  ${plan.constraints.min_days} | Max days: ${plan.constraints.max_days}`,
+  );
+  lines.push(
+    `Adults:    ${plan.constraints.adults} | Children: [${plan.constraints.children.join(", ")}]`,
+  );
+  lines.push("");
+  lines.push("Checklist:");
+  for (const item of plan.checklist) {
+    const mark =
+      item.status === "done"
+        ? "x"
+        : item.status === "failed"
+          ? `! FAILED${item.note ? ": " + item.note : ""}`
+          : item.status === "doing"
+            ? "~"
+            : " ";
+    lines.push(`[${mark}] ${item.task}`);
+  }
+  if (plan.search_checklist.length > 0) {
+    lines.push("");
+    lines.push("Search Checklist:");
+    for (const item of plan.search_checklist) {
+      const mark =
+        item.status === "done"
+          ? "x"
+          : item.status === "failed"
+            ? `! FAILED${item.note ? ": " + item.note : ""}`
+            : " ";
+      lines.push(`[${mark}] ${item.description}`);
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+function inferNextPhase(plan: PlanState): string {
+  const c = plan.checklist;
+  const sc = plan.search_checklist;
+  const find = (sub: string) =>
+    c.find((i) => i.task.toLowerCase().includes(sub.toLowerCase()));
+
+  const scouting = find("Scouting");
+  const extractor = find("Extractor");
+  const searchCL = find("Search Checklist");
+  const scraping = find("Scraping");
+  const report = find("Final Report");
+
+  if (scouting && scouting.status === "todo") return "Phase 1: Scouting";
+  if (extractor && extractor.status === "todo") return "Phase 2: Extractor";
+  if (searchCL && searchCL.status === "todo")
+    return "Phase 2: Search Checklist";
+  if (sc.some((i) => i.status === "todo")) return "Phase 3: Scraping & Search";
+  if (scraping && scraping.status === "todo")
+    return "Phase 3: Scraping & Search";
+  if (report && report.status === "todo") return "Phase 4: Report";
+  return "Complete";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TOOL REGISTRATION
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export function register(api: any, config: any = {}) {
   const dbPath = config.dbPath || DB_PATH;
 
-  // ─── Strategy registries ──────────────────────────────────────────────────
   const skyscanner = new SkyscannerStrategy();
   const kayakFlight = new KayakFlightStrategy();
   const kayakTrain = new KayakTrainStrategy();
@@ -26,23 +337,421 @@ export function register(api: any, config: any = {}) {
     { name: "skyscanner", strategy: skyscanner },
     { name: "kayak", strategy: kayakFlight },
   ];
-
   const trainStrategies = [{ name: "kayak", strategy: kayakTrain }];
-
   const camperStrategies: Array<{
     name: string;
     strategy: CamperScraperStrategy;
   }> = [{ name: "yescapa", strategy: new YescapaStrategy() }];
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: date_scout
-  // ─────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PLAN TOOLS (NEW)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  api.registerTool({
+    name: "plan_init",
+    description:
+      "Initializes a travel planning session, creates resource directory and initial plan.md.",
+    parameters: {
+      type: "object",
+      required: [
+        "session_id",
+        "transport",
+        "trip_type",
+        "routes",
+        "months",
+        "constraints",
+      ],
+      properties: {
+        session_id: { type: "string" },
+        transport: { type: "string", enum: ["flight", "train"] },
+        trip_type: {
+          type: "string",
+          enum: ["one-way", "round-trip", "open-jaw"],
+        },
+        routes: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["origin", "destination"],
+            properties: {
+              origin: { type: "string" },
+              destination: { type: "string" },
+            },
+          },
+        },
+        months: { type: "array", items: { type: "string" } },
+        constraints: {
+          type: "object",
+          required: ["adults", "children"],
+          properties: {
+            adults: { type: "number" },
+            children: { type: "array", items: { type: "number" } },
+            min_days: { type: "number" },
+            max_days: { type: "number" },
+          },
+        },
+      },
+    },
+    async execute(_id: string, params: any) {
+      const checklist = [
+        { task: "Session Init", status: "done" },
+        { task: "Scouting Phase", status: "todo" },
+        { task: "Extractor Phase", status: "todo" },
+        { task: "Search Checklist", status: "todo" },
+        { task: "Scraping Phase", status: "todo" },
+        { task: "Final Report", status: "todo" },
+      ];
+      if (params.transport === "train") {
+        checklist.push({ task: "Email Report", status: "todo" });
+      }
+
+      const plan: PlanState = {
+        session_id: params.session_id,
+        transport: params.transport,
+        trip_type: params.trip_type,
+        routes: params.routes,
+        months: params.months,
+        constraints: {
+          min_days: params.constraints.min_days ?? 2,
+          max_days: params.constraints.max_days ?? 14,
+          adults: params.constraints.adults,
+          children: params.constraints.children ?? [],
+        },
+        checklist,
+        search_checklist: [],
+        created_at: new Date().toISOString(),
+      };
+
+      planWrite(params.session_id, plan);
+
+      const resDir = `/home/openclaw/.openclaw/workspace/resources/${params.session_id}`;
+      mkdirSync(resDir, { recursive: true });
+      writeFileSync(`${resDir}/plan.md`, renderPlanMarkdown(plan), "utf8");
+
+      return { status: "success", plan_path: `${resDir}/plan.md` };
+    },
+  });
+
+  api.registerTool({
+    name: "plan_mark",
+    description: "Updates status of checklist items and re-renders plan.md.",
+    parameters: {
+      type: "object",
+      required: ["session_id", "items"],
+      properties: {
+        session_id: { type: "string" },
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["task", "status"],
+            properties: {
+              task: {
+                type: "string",
+                description: "Literal match or substring",
+              },
+              status: {
+                type: "string",
+                enum: ["todo", "doing", "done", "failed"],
+              },
+              note: { type: "string" },
+            },
+          },
+        },
+      },
+    },
+    async execute(_id: string, params: any) {
+      const plan = planRead(params.session_id) as PlanState | null;
+      if (!plan) return { status: "error", message: "Plan not found" };
+
+      for (const update of params.items) {
+        const needle = update.task.toLowerCase();
+        // Check main checklist
+        const main = plan.checklist.find((i) =>
+          i.task.toLowerCase().includes(needle),
+        );
+        if (main) {
+          main.status = update.status;
+          if (update.note) main.note = update.note;
+          continue;
+        }
+        // Check search checklist
+        const search = plan.search_checklist.find((i) =>
+          i.description.toLowerCase().includes(needle),
+        );
+        if (search) {
+          search.status = update.status;
+          if (update.note) search.note = update.note;
+        }
+      }
+
+      planWrite(params.session_id, plan);
+      const resDir = `/home/openclaw/.openclaw/workspace/resources/${params.session_id}`;
+      writeFileSync(`${resDir}/plan.md`, renderPlanMarkdown(plan), "utf8");
+
+      return { status: "success", next_phase: inferNextPhase(plan) };
+    },
+  });
+
+  api.registerTool({
+    name: "plan_append_searches",
+    description:
+      "Appends granular search combinations to the plan's search checklist.",
+    parameters: {
+      type: "object",
+      required: ["session_id", "combinations"],
+      properties: {
+        session_id: { type: "string" },
+        combinations: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["description"],
+            properties: { description: { type: "string" } },
+          },
+        },
+      },
+    },
+    async execute(_id: string, params: any) {
+      const plan = planRead(params.session_id) as PlanState | null;
+      if (!plan) return { status: "error", message: "Plan not found" };
+
+      for (const combo of params.combinations) {
+        plan.search_checklist.push({
+          description: combo.description,
+          status: "todo",
+        });
+      }
+
+      // Mark "Search Checklist" step as done
+      const scItem = plan.checklist.find((i) =>
+        i.task.toLowerCase().includes("search checklist"),
+      );
+      if (scItem) scItem.status = "done";
+
+      planWrite(params.session_id, plan);
+      const resDir = `/home/openclaw/.openclaw/workspace/resources/${params.session_id}`;
+      writeFileSync(`${resDir}/plan.md`, renderPlanMarkdown(plan), "utf8");
+
+      return { status: "success", count: params.combinations.length };
+    },
+  });
+
+  api.registerTool({
+    name: "plan_status",
+    description: "Returns a compact summary of the current session state.",
+    parameters: {
+      type: "object",
+      required: ["session_id"],
+      properties: { session_id: { type: "string" } },
+    },
+    async execute(_id: string, params: any) {
+      const plan = planRead(params.session_id) as PlanState | null;
+      if (!plan) return { status: "error", message: "Plan not found" };
+
+      const all = [
+        ...plan.checklist,
+        ...plan.search_checklist.map((s) => ({
+          task: s.description,
+          status: s.status,
+        })),
+      ];
+      return {
+        status: "success",
+        transport: plan.transport,
+        trip_type: plan.trip_type,
+        current_phase: inferNextPhase(plan),
+        done: all.filter((i) => i.status === "done").length,
+        failed: all.filter((i) => i.status === "failed").length,
+        pending: all.filter((i) => i.status === "todo").length,
+        total: all.length,
+      };
+    },
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // REPORT TOOLS (NEW)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  api.registerTool({
+    name: "report_build",
+    description:
+      "Renders the final report.md based on DB results and the session plan.",
+    parameters: {
+      type: "object",
+      required: ["session_id"],
+      properties: { session_id: { type: "string" } },
+    },
+    async execute(_id: string, params: any) {
+      const plan = planRead(params.session_id) as PlanState | null;
+      if (!plan) return { status: "error", message: "Plan not found" };
+
+      const db = new TravelDB(dbPath);
+      try {
+        let markdown: string;
+
+        if (plan.transport === "train") {
+          // ← CHANGED: session-only query, no origin/destination filter
+          const rows = db.queryTrainOptions({
+            session_id: params.session_id,
+            limit: 2,
+            sort_by: "price",
+            sort_dir: "asc",
+          });
+          const camperRows = db.getRankedCampers(params.session_id);
+          markdown = renderTrainReport(plan, rows, camperRows);
+        } else {
+          const rows = db.queryFlightOptions({
+            session_id: params.session_id,
+            limit: 2,
+            sort_by: "price",
+            sort_dir: "asc",
+          });
+          markdown = renderFlightReport(plan, rows);
+        }
+
+        const resDir = `/home/openclaw/.openclaw/workspace/resources/${params.session_id}`;
+        mkdirSync(resDir, { recursive: true });
+        const reportPath = `${resDir}/report.md`;
+        writeFileSync(reportPath, markdown, "utf8");
+
+        // Build a compact summary for the orchestrator's chat reply
+        const optionCount = (markdown.match(/### [🗓️✈️]/g) || []).length;
+        const summary =
+          optionCount > 0
+            ? `${optionCount} opciones generadas`
+            : "Sin resultados";
+
+        return { status: "success", report_path: reportPath, summary };
+      } catch (error: any) {
+        return { status: "error", message: error.message };
+      } finally {
+        db.close();
+      }
+    },
+  });
+
+  api.registerTool({
+    name: "report_send",
+    description: "Sends the generated report.md as an email.",
+    parameters: {
+      type: "object",
+      required: ["session_id", "subject"],
+      properties: {
+        session_id: { type: "string" },
+        subject: { type: "string" },
+      },
+    },
+    async execute(_id: string, params: any) {
+      const resDir = `/home/openclaw/.openclaw/workspace/resources/${params.session_id}`;
+      const reportPath = `${resDir}/report.md`;
+
+      if (!existsSync(reportPath)) {
+        return {
+          status: "error",
+          message: "report.md not found. Run report_build first.",
+        };
+      }
+
+      const body = readFileSync(reportPath, "utf-8");
+      const emailServiceUrl =
+        config.emailServiceUrl ||
+        process.env.EMAIL_SERVICE_URL ||
+        "http://localhost:3000";
+
+      try {
+        const response = await fetch(`${emailServiceUrl}/api/email`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ subject: params.subject, body }),
+        });
+        if (!response.ok) {
+          const detail = await response.text();
+          return {
+            status: "error",
+            message: `Email service ${response.status}: ${detail}`,
+          };
+        }
+        const result = await response.json();
+        return { status: "success", messageId: result.messageId };
+      } catch (err: any) {
+        return { status: "error", message: err.message };
+      }
+    },
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // RANKED CAMPERS TOOL (NEW — replaces camper_store for the subagent)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  api.registerTool({
+    name: "store_ranked_campers",
+    description: "Persists LLM-evaluated camper rankings to the database.",
+    parameters: {
+      type: "object",
+      required: ["session_id", "results"],
+      properties: {
+        session_id: { type: "string" },
+        results: {
+          type: "array",
+          items: {
+            type: "object",
+            required: [
+              "city",
+              "date_from",
+              "date_to",
+              "option_id",
+              "rank",
+              "score",
+            ],
+            properties: {
+              city: { type: "string" },
+              date_from: { type: "string" },
+              date_to: { type: "string" },
+              option_id: { type: "number" },
+              rank: { type: "number" },
+              score: { type: "number" },
+              score_reason: { type: "string" },
+              station_dist_km: { type: "number" },
+            },
+          },
+        },
+      },
+    },
+    async execute(_id: string, params: any) {
+      const db = new TravelDB(dbPath);
+      try {
+        for (const r of params.results) {
+          db.upsertRankedCamper({
+            session_id: params.session_id,
+            city: r.city,
+            date_from: r.date_from,
+            date_to: r.date_to,
+            option_id: r.option_id,
+            rank: r.rank,
+            score: r.score,
+            score_reason: r.score_reason,
+            station_dist_km: r.station_dist_km,
+          });
+        }
+        return { status: "success", count: params.results.length };
+      } catch (e: any) {
+        return { status: "error", message: e.message };
+      } finally {
+        db.close();
+      }
+    },
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EXISTING TOOLS (unchanged)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ─── date_scout ─────────────────────────────────────────────────────────────
   api.registerTool(
     {
       name: "date_scout",
-      description: `Scouts cheapest flight dates for one or more route/month combinations
-across all available strategies. All combinations run concurrently.
-Results are stored in the DB and queryable via find_best_date_combinations.`,
+      description: `Scouts cheapest flight dates for one or more route/month combinations across all available strategies.`,
       parameters: {
         type: "object",
         properties: {
@@ -81,7 +790,6 @@ Results are stored in the DB and queryable via find_best_date_combinations.`,
             dbPath,
           })),
         });
-
         return {
           status:
             batchResult.summary.error === 0
@@ -96,38 +804,27 @@ Results are stored in the DB and queryable via find_best_date_combinations.`,
     { optional: true },
   );
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: train_scout
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── train_scout ────────────────────────────────────────────────────────────
   api.registerTool(
     {
       name: "train_scout",
-      description: `Scouts cheapest train dates for one or more route/month combinations
-using trenes.com API (no browser required — pure HTTP).
-Accepts city names in Spanish (e.g. "Madrid", "Sevilla").
-Station IDs are resolved automatically via getEstaciones API.
-All combinations run concurrently. Partial results returned on failures.
-Results stored in train_scouts table, queryable via find_best_train_date_combinations.`,
+      description: `Scouts cheapest train dates via trenes.com API. Accepts city names in Spanish.`,
       parameters: {
         type: "object",
         properties: {
-          session_id: {
-            type: "string",
-            description: "Orchestrator session ID",
-          },
+          session_id: { type: "string" },
           routes: {
             type: "array",
-            description: "Route + month combinations to scout.",
             items: {
               type: "object",
               properties: {
                 origin_city: {
                   type: "string",
-                  description: 'City name in Spanish, e.g. "Madrid"',
+                  description: "City name in Spanish",
                 },
                 destination_city: {
                   type: "string",
-                  description: 'City name in Spanish, e.g. "Sevilla"',
+                  description: "City name in Spanish",
                 },
                 month: { type: "string", description: "YYYY-MM format" },
               },
@@ -149,7 +846,6 @@ Results stored in train_scouts table, queryable via find_best_train_date_combina
             dbPath,
           })),
         });
-
         return {
           status:
             batchResult.summary.error === 0
@@ -164,41 +860,25 @@ Results stored in train_scouts table, queryable via find_best_train_date_combina
     { optional: true },
   );
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: flight_scraper
-  // ─────────────────────────────────────────────────────────────────────────
-  // Flights only (Skyscanner + Kayak flights). Trains are handled by train_scraper.
+  // ─── flight_scraper ─────────────────────────────────────────────────────────
   api.registerTool(
     {
       name: "flight_scraper",
-      description: `Searches flights for one or more date combinations across
-Skyscanner and Kayak concurrently.
-All tasks run concurrently via Promise.allSettled. Partial results on failure.
-For trains, use the separate train_scraper tool.`,
+      description: `Searches flights across Skyscanner and Kayak concurrently.`,
       parameters: {
         type: "object",
         properties: {
-          session_id: { type: "string", description: "Session ID" },
-          pax: { type: "number", description: "Number of passengers" },
+          session_id: { type: "string" },
+          pax: { type: "number" },
           combinations: {
             type: "array",
-            description: "Date combinations to search.",
             items: {
               type: "object",
               properties: {
-                origin: { type: "string", description: "Lowercase IATA code" },
-                destination: {
-                  type: "string",
-                  description: "Lowercase IATA code",
-                },
-                exact_date: {
-                  type: "string",
-                  description: "Outbound date YYYY-MM-DD",
-                },
-                return_date: {
-                  type: "string",
-                  description: "Return date YYYY-MM-DD (optional, round trips)",
-                },
+                origin: { type: "string" },
+                destination: { type: "string" },
+                exact_date: { type: "string" },
+                return_date: { type: "string" },
               },
               required: ["origin", "destination", "exact_date"],
             },
@@ -208,9 +888,8 @@ For trains, use the separate train_scraper tool.`,
       },
       async execute(_id: string, params: any) {
         const allResults: any[] = [];
-        let totalSuccess = 0;
-        let totalError = 0;
-
+        let totalSuccess = 0,
+          totalError = 0;
         for (const s of flightStrategies) {
           const batchResult = await s.strategy.scrapeFlightsBatch({
             session_id: params.session_id,
@@ -225,17 +904,12 @@ For trains, use the separate train_scraper tool.`,
               dbPath,
             })),
           });
-
-          // Add site info to results
-          const mapped = batchResult.results.map((r) => ({
-            site: s.name,
-            ...r,
-          }));
-          allResults.push(...mapped);
+          allResults.push(
+            ...batchResult.results.map((r) => ({ site: s.name, ...r })),
+          );
           totalSuccess += batchResult.summary.success;
           totalError += batchResult.summary.error;
         }
-
         return {
           status:
             totalError === 0
@@ -250,26 +924,17 @@ For trains, use the separate train_scraper tool.`,
     { optional: true },
   );
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: train_scraper
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── train_scraper ──────────────────────────────────────────────────────────
   api.registerTool(
     {
       name: "train_scraper",
-      description: `Searches trains for one or more date combinations.
-Currently uses Kayak Trains. All combinations run concurrently.
-Set children= per combination if travelling with children (array of ages).
-Results are stored in a separate DB table from flights.`,
+      description: `Searches trains via Kayak. All combinations run concurrently.`,
       parameters: {
         type: "object",
         properties: {
           session_id: { type: "string" },
           adults: { type: "number" },
-          children: {
-            type: "array",
-            items: { type: "number" },
-            description: "Child ages (empty array if no children).",
-          },
+          children: { type: "array", items: { type: "number" } },
           combinations: {
             type: "array",
             items: {
@@ -277,11 +942,8 @@ Results are stored in a separate DB table from flights.`,
               properties: {
                 origin: { type: "string" },
                 destination: { type: "string" },
-                exact_date: { type: "string", description: "YYYY-MM-DD" },
-                return_date: {
-                  type: "string",
-                  description: "YYYY-MM-DD, optional",
-                },
+                exact_date: { type: "string" },
+                return_date: { type: "string" },
               },
               required: ["origin", "destination", "exact_date"],
             },
@@ -291,9 +953,8 @@ Results are stored in a separate DB table from flights.`,
       },
       async execute(_id: string, params: any) {
         const allResults: any[] = [];
-        let totalSuccess = 0;
-        let totalError = 0;
-
+        let totalSuccess = 0,
+          totalError = 0;
         for (const s of trainStrategies) {
           const batchResult = await s.strategy.scrapeTrainsBatch({
             session_id: params.session_id,
@@ -309,16 +970,12 @@ Results are stored in a separate DB table from flights.`,
               dbPath,
             })),
           });
-
-          const mapped = batchResult.results.map((r) => ({
-            site: s.name,
-            ...r,
-          }));
-          allResults.push(...mapped);
+          allResults.push(
+            ...batchResult.results.map((r) => ({ site: s.name, ...r })),
+          );
           totalSuccess += batchResult.summary.success;
           totalError += batchResult.summary.error;
         }
-
         return {
           status:
             totalError === 0
@@ -333,9 +990,7 @@ Results are stored in a separate DB table from flights.`,
     { optional: true },
   );
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: find_best_date_combinations
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── find_best_date_combinations ────────────────────────────────────────────
   api.registerTool({
     name: "find_best_date_combinations",
     description:
@@ -347,14 +1002,11 @@ Results are stored in a separate DB table from flights.`,
         destination: { type: "string" },
         session_id: { type: "string" },
         top: { type: "number" },
-        months: {
-          type: "string",
-          description: "Comma-separated YYYY-MM months",
-        },
+        months: { type: "string" },
         min_days: { type: "number" },
         max_days: { type: "number" },
-        return_origin: { type: "string", description: "Open-jaw only" },
-        return_destination: { type: "string", description: "Open-jaw only" },
+        return_origin: { type: "string" },
+        return_destination: { type: "string" },
       },
       required: ["origin", "destination", "session_id"],
     },
@@ -388,41 +1040,22 @@ Results are stored in a separate DB table from flights.`,
     },
   });
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: find_best_train_date_combinations
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── find_best_train_date_combinations ──────────────────────────────────────
   api.registerTool({
     name: "find_best_train_date_combinations",
-    description: `Analyzes train scouting data (trenes.com) and returns the best date windows.
-Requires train_scout to have run first for the given session and routes.
-City names must match exactly what was passed to train_scout.`,
+    description: `Analyzes train scouting data and returns the best date windows.`,
     parameters: {
       type: "object",
       properties: {
         session_id: { type: "string" },
-        origin_city: {
-          type: "string",
-          description: "Same city name used in train_scout",
-        },
-        destination_city: {
-          type: "string",
-          description: "Same city name used in train_scout",
-        },
-        months: {
-          type: "string",
-          description: "Comma-separated YYYY-MM months",
-        },
+        origin_city: { type: "string" },
+        destination_city: { type: "string" },
+        months: { type: "string" },
         min_days: { type: "number" },
         max_days: { type: "number" },
-        top: {
-          type: "number",
-          description: "Max combinations to return (default 5)",
-        },
-        return_origin_city: { type: "string", description: "Open-jaw only" },
-        return_destination_city: {
-          type: "string",
-          description: "Open-jaw only",
-        },
+        top: { type: "number" },
+        return_origin_city: { type: "string" },
+        return_destination_city: { type: "string" },
       },
       required: ["session_id", "origin_city", "destination_city"],
     },
@@ -432,13 +1065,10 @@ City names must match exactly what was passed to train_scout.`,
         const months = params.months
           ? params.months.split(",").map((m: string) => m.trim())
           : [];
-
-        // Resolve station IDs from city names (needed for DB lookup)
         const originStation = await resolveStation(params.origin_city);
         const destinationStation = await resolveStation(
           params.destination_city,
         );
-
         let retOriginStation = {
           id: destinationStation.id,
           name: destinationStation.name,
@@ -447,15 +1077,12 @@ City names must match exactly what was passed to train_scout.`,
           id: originStation.id,
           name: originStation.name,
         };
-
-        if (params.return_origin_city) {
+        if (params.return_origin_city)
           retOriginStation = await resolveStation(params.return_origin_city);
-        }
-        if (params.return_destination_city) {
+        if (params.return_destination_city)
           retDestinationStation = await resolveStation(
             params.return_destination_city,
           );
-        }
 
         const results = db.extractTrainDateCombinations({
           origin_id: originStation.id,
@@ -476,7 +1103,6 @@ City names must match exactly what was passed to train_scout.`,
           return_origin_city: params.return_origin_city,
           return_destination_city: params.return_destination_city,
         });
-
         return { status: "success", data: results };
       } catch (error: any) {
         return {
@@ -490,22 +1116,17 @@ City names must match exactly what was passed to train_scout.`,
     },
   });
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: consolidate_final_flight_report
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── consolidate_final_flight_report ────────────────────────────────────────
   api.registerTool({
     name: "consolidate_final_flight_report",
-    description: `Retrieves verified flight options from the DB. Never triggers scraping.
-
-CALL ONCE per session — returns all scraped combos grouped by site.
-Do NOT call multiple times for the same session/dates.`,
+    description: `Retrieves verified flight options from the DB. CALL ONCE per session.`,
     parameters: {
       type: "object",
       properties: {
         session_id: { type: "string" },
-        origin: { type: "string", description: "Lowercase IATA code" },
-        destination: { type: "string", description: "Lowercase IATA code" },
-        limit: { type: "number", description: "Max options PER itinerary" },
+        origin: { type: "string" },
+        destination: { type: "string" },
+        limit: { type: "number" },
         sort_by: { type: "string", enum: ["price", "dep_time", "stops"] },
         sort_dir: { type: "string", enum: ["asc", "desc"] },
       },
@@ -535,9 +1156,7 @@ Do NOT call multiple times for the same session/dates.`,
     },
   });
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: consolidate_final_train_report
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── consolidate_final_train_report ─────────────────────────────────────────
   api.registerTool({
     name: "consolidate_final_train_report",
     description: `Retrieves verified train options from the DB.`,
@@ -577,46 +1196,33 @@ Do NOT call multiple times for the same session/dates.`,
     },
   });
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: fetch_campers_for_analysis
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── fetch_campers_for_analysis ─────────────────────────────────────────────
   api.registerTool({
     name: "fetch_campers_for_analysis",
-    description: `Retrieves top-N campers per vehicle type for LLM reranking across multiple date combinations.
-Returns raw camper data including coordinates. Intended to be passed
-to the camper-analyzer subagent, not displayed directly.
-CALL EXACTLY ONCE with all combinations that succeeded scraping.`,
+    description: `Retrieves top-N campers per vehicle type for LLM reranking. CALL EXACTLY ONCE.`,
     parameters: {
       type: "object",
       properties: {
         session_id: { type: "string" },
         combinations: {
           type: "array",
-          description: "List of combinations to fetch data for",
           items: {
             type: "object",
             properties: {
               city: { type: "string" },
-              date_from: { type: "string", description: "YYYY-MM-DD" },
-              date_to: { type: "string", description: "YYYY-MM-DD" },
+              date_from: { type: "string" },
+              date_to: { type: "string" },
             },
             required: ["city", "date_from", "date_to"],
           },
         },
-        limit_per_type: {
-          type: "number",
-          description: "Max per vehicle_type (default 5)",
-        },
+        limit_per_type: { type: "number" },
       },
       required: ["session_id", "combinations"],
     },
     async execute(_id: string, params: any) {
-      const t0 = Date.now();
       const db = new TravelDB(dbPath);
       try {
-        logger.info(
-          `[fetch_campers_for_analysis] START session=${params.session_id} city=${params.city} date=${params.date_from}→${params.date_to}`,
-        );
         const results = db.queryCamperOptionsMulti({
           session_id: params.session_id,
           combinations: params.combinations,
@@ -625,14 +1231,8 @@ CALL EXACTLY ONCE with all combinations that succeeded scraping.`,
           sort_by: "price",
           sort_dir: "asc",
         });
-        logger.info(
-          `[fetch_campers_for_analysis] session=${params.session_id} city=${params.city} date=${params.date_from}→${params.date_to} rows=${results.length} took=${Date.now() - t0}ms`,
-        );
         return { status: "success", data: results };
       } catch (error: any) {
-        logger.error(
-          `[fetch_campers_for_analysis] FAILED after ${Date.now() - t0}ms — ${error.message}`,
-        );
         return { status: "error", message: error.message };
       } finally {
         db.close();
@@ -640,81 +1240,39 @@ CALL EXACTLY ONCE with all combinations that succeeded scraping.`,
     },
   });
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: camper_scraper
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── camper_scraper ─────────────────────────────────────────────────────────
   api.registerTool(
     {
       name: "camper_scraper",
-      description: `[v3 — contrato completo] Busca autocaravanas en Yescapa con filtros avanzados.
-Soporta tipos de vehículo, número de cinturones, camas y equipamiento.
-Extrae la x-api-key de la home y resuelve la localización dinámicamente.
-Devuelve el total_count y guarda el JSON completo en disco.`,
+      description: `Busca autocaravanas en Yescapa con filtros avanzados.`,
       parameters: {
         type: "object",
         properties: {
-          session_id: {
-            type: "string",
-            description: "Orchestrator session ID",
-          },
+          session_id: { type: "string" },
           combinations: {
             type: "array",
-            description: "City + date combinations to search.",
             items: {
               type: "object",
               properties: {
-                city: {
-                  type: "string",
-                  description:
-                    'Ciudad de recogida en español, e.g. "Barcelona"',
-                },
-                date_from: {
-                  type: "string",
-                  description: "Fecha de inicio YYYY-MM-DD",
-                },
-                date_to: {
-                  type: "string",
-                  description: "Fecha de fin YYYY-MM-DD",
-                },
+                city: { type: "string" },
+                date_from: { type: "string" },
+                date_to: { type: "string" },
               },
               required: ["city", "date_from", "date_to"],
             },
           },
-          types: {
-            type: "array",
-            items: { type: "number" },
-            description:
-              "IDs de tipo: 1:Perfilada, 2:Capuchina, 3:Integral, 4:Gran Volumen, 5:Van, 6:Caravana. Default: [] (todos)",
-          },
-          seatbelts: {
-            type: "number",
-            description: "Mínimo de cinturones. Default: omitido",
-          },
-          beds: {
-            type: "number",
-            description: "Mínimo de camas. Default: omitido",
-          },
-          equipment: {
-            type: "array",
-            items: { type: "string" },
-            description:
-              "Filtros: ac, shower_int, fridge, heating, gps, tv, wc, bedding, bike_rack, solar. Default: [ac, shower_int, fridge]",
-          },
-          page_size: {
-            type: "number",
-            description: "Resultados por página. Default: 20",
-          },
+          types: { type: "array", items: { type: "number" } },
+          seatbelts: { type: "number" },
+          beds: { type: "number" },
+          equipment: { type: "array", items: { type: "string" } },
+          page_size: { type: "number" },
         },
         required: ["session_id", "combinations"],
       },
       async execute(_id: string, params: any) {
-        logger.info(
-          `[Tool/camper_scraper] Inciando búsqueda para ${params.combinations.length} combinaciones (Session: ${params.session_id})`,
-        );
         const allResults: any[] = [];
-        let totalSuccess = 0;
-        let totalError = 0;
-
+        let totalSuccess = 0,
+          totalError = 0;
         for (const s of camperStrategies) {
           const batchResult = await s.strategy.scrapeCampersBatch({
             session_id: params.session_id,
@@ -726,19 +1284,12 @@ Devuelve el total_count y guarda el JSON completo en disco.`,
             equipment: params.equipment ?? ["ac", "shower_int", "fridge"],
             page_size: params.page_size ?? 20,
           });
-
-          const mapped = batchResult.results.map((r) => ({
-            site: s.name,
-            ...r,
-          }));
-          allResults.push(...mapped);
+          allResults.push(
+            ...batchResult.results.map((r) => ({ site: s.name, ...r })),
+          );
           totalSuccess += batchResult.summary.success;
           totalError += batchResult.summary.error;
         }
-
-        logger.info(
-          `[Tool/camper_scraper] Completado: ${totalSuccess} success, ${totalError} error.`,
-        );
         return {
           status:
             totalError === 0
@@ -753,27 +1304,16 @@ Devuelve el total_count y guarda el JSON completo en disco.`,
     { optional: true },
   );
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: send_report_email
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── send_report_email (legacy — kept for backward compat) ──────────────────
   api.registerTool(
     {
       name: "send_report_email",
-      description: `Sends a Markdown file as a formatted HTML email via the email service.
-Reads the file at the given absolute path and posts it to the configured
-EMAIL_SERVICE_URL. Use after writing report.md to deliver results to the
-recipient configured in the email service.`,
+      description: `Sends a Markdown file as a formatted HTML email. Legacy — prefer report_send.`,
       parameters: {
         type: "object",
         properties: {
-          file_path: {
-            type: "string",
-            description: "Absolute path to the Markdown file to send.",
-          },
-          subject: {
-            type: "string",
-            description: "Email subject line.",
-          },
+          file_path: { type: "string" },
+          subject: { type: "string" },
         },
         required: ["file_path", "subject"],
       },
@@ -782,8 +1322,6 @@ recipient configured in the email service.`,
           config.emailServiceUrl ||
           process.env.EMAIL_SERVICE_URL ||
           "http://localhost:3000";
-
-        // Read the markdown file
         let body: string;
         try {
           body = readFileSync(params.file_path, "utf-8");
@@ -791,79 +1329,39 @@ recipient configured in the email service.`,
           return {
             status: "error",
             reason: "file_read_failed",
-            message: `Could not read file at "${params.file_path}": ${err.message}`,
+            message: err.message,
           };
         }
-
-        // POST to the email service
-        let response: Response;
         try {
-          response = await fetch(`${emailServiceUrl}/api/email`, {
+          const response = await fetch(`${emailServiceUrl}/api/email`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ subject: params.subject, body }),
           });
-        } catch (err: any) {
-          return {
-            status: "error",
-            reason: "email_service_unreachable",
-            message: `Could not reach email service at "${emailServiceUrl}": ${err.message}`,
-          };
-        }
-
-        if (!response.ok) {
-          let detail = "";
-          try {
-            const json = await response.json();
-            detail = json.error ?? JSON.stringify(json);
-          } catch {
-            detail = await response.text();
+          if (!response.ok) {
+            return { status: "error", message: `${response.status}` };
           }
-          return {
-            status: "error",
-            reason: "email_service_error",
-            message: `Email service responded ${response.status}: ${detail}`,
-          };
+          const result = await response.json();
+          return { status: "success", messageId: result.messageId };
+        } catch (err: any) {
+          return { status: "error", message: err.message };
         }
-
-        const result = await response.json();
-        return {
-          status: "success",
-          messageId: result.messageId,
-        };
       },
     },
     { optional: true },
   );
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: camper_store
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── camper_store (legacy — kept for backward compat) ───────────────────────
   api.registerTool(
     {
       name: "camper_store",
-      description: `Persists a camper results payload to internal extension storage (store/campers/),
-keyed by session_id + namespace. Use from the camper-orchestrator subagent to pass
-structured results back to the orchestrator without needing workspace write access.
-The orchestrator retrieves it via camper_fetch once the subagent completes.`,
+      description: `Legacy camper results store. Prefer store_ranked_campers.`,
       parameters: {
         type: "object",
         properties: {
-          session_id: {
-            type: "string",
-            description:
-              "Orchestrator session ID — must match the parent session.",
-          },
-          namespace: {
-            type: "string",
-            description:
-              'Logical name for this payload, e.g. "results". Unique per session.',
-          },
-          data: {
-            type: "object",
-            description:
-              "Arbitrary JSON payload to store (camper results, markdown, etc.).",
-          },
+          session_id: { type: "string" },
+          namespace: { type: "string" },
+          data: { type: "object" },
         },
         required: ["session_id", "namespace", "data"],
       },
@@ -883,38 +1381,27 @@ The orchestrator retrieves it via camper_fetch once the subagent completes.`,
     { optional: true },
   );
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // TOOL: camper_fetch
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─── camper_fetch ───────────────────────────────────────────────────────────
   api.registerTool({
     name: "camper_fetch",
-    description: `Retrieves a camper results payload previously stored via camper_store.
-Call from the orchestrator after the camper-orchestrator subagent completion event.
-Returns status "not_found" if no payload exists yet for the given session_id + namespace.`,
+    description: `Retrieves a camper results payload previously stored via camper_store.`,
     parameters: {
       type: "object",
       properties: {
-        session_id: {
-          type: "string",
-          description: "Orchestrator session ID.",
-        },
-        namespace: {
-          type: "string",
-          description: 'Logical name used when storing, e.g. "results".',
-        },
+        session_id: { type: "string" },
+        namespace: { type: "string" },
       },
       required: ["session_id", "namespace"],
     },
     async execute(_id: string, params: any) {
       try {
         const data = camperRead(params.session_id, params.namespace);
-        if (data === null) {
+        if (data === null)
           return {
             status: "not_found",
             session_id: params.session_id,
             namespace: params.namespace,
           };
-        }
         return {
           status: "success",
           session_id: params.session_id,
