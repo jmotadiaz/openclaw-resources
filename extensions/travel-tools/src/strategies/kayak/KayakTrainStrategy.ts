@@ -69,20 +69,35 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
         script: scripts.KAYAK_ACCEPT_COOKIES_JS,
       });
 
-      // PHASE 1: wait for progress bar to disappear (max 90s)
+      // PHASE 1: wait for progress bar to disappear AND stabilize.
+      // Kayak loads results in multiple rounds — the progress bar may go
+      // hidden briefly between rounds and then reappear for the next batch
+      // of slower providers.  We require the bar to stay hidden for
+      // STABILITY_CHECKS consecutive polls before considering it truly done.
+      const STABILITY_CHECKS = 3;   // consecutive "done" polls required
+      const MAX_POLLS = 45;         // 45 × 2s = 90s max
+      let consecutiveDone = 0;
       let progressDone = false;
-      for (let i = 0; i < 45; i++) {
+
+      for (let i = 0; i < MAX_POLLS; i++) {
         const check = await browser.callTool("execute_script", {
           instance_id: browser.instance_id,
           script: scripts.KAYAK_CHECK_PROGRESS_DONE_JS,
         });
         const data = this.parseResult(check);
         logger.info(
-          `[KayakTrain] Progress poll ${i + 1}: done=${data.done} barFound=${data.found}`,
+          `[KayakTrain] Progress poll ${i + 1}: done=${data.done} barFound=${data.found} consecutive=${consecutiveDone}`,
         );
+
         if (data.done) {
-          progressDone = true;
-          break;
+          consecutiveDone++;
+          if (consecutiveDone >= STABILITY_CHECKS) {
+            progressDone = true;
+            break;
+          }
+        } else {
+          // Bar reappeared — reset the counter
+          consecutiveDone = 0;
         }
         await sleep(2_000);
       }

@@ -80,7 +80,11 @@ export function register(api: any, config: any = {}) {
             },
           },
         },
-        months: { type: "array", items: { type: "string" } },
+        months: {
+          type: "array",
+          description: "Requerido cuando mode='explore'.",
+          items: { type: "string" },
+        },
         constraints: {
           type: "object",
           required: ["adults", "children"],
@@ -91,18 +95,66 @@ export function register(api: any, config: any = {}) {
             max_days: { type: "number" },
           },
         },
+        mode: {
+          type: "string",
+          enum: ["explore", "direct"],
+          description:
+            "explore = fechas abiertas (flujo completo con scouting). direct = rutas/fechas concretas (salta al scraping).",
+        },
+        combinations: {
+          type: "array",
+          description:
+            "Requerido cuando mode='direct'. Origen y destino deben ser codigos IATA.",
+          items: {
+            type: "object",
+            required: ["origin", "destination", "exact_date"],
+            properties: {
+              origin: { type: "string" },
+              destination: { type: "string" },
+              exact_date: { type: "string" },
+              return_date: { type: "string" },
+            },
+          },
+        },
       },
     },
     async execute(_id: string, params: any) {
+      const mode = params.mode ?? "explore";
+      const isDirect = mode === "direct";
+
+      // ── Validación: direct requiere combinations ──
+      if (
+        isDirect &&
+        (!params.combinations || params.combinations.length === 0)
+      ) {
+        return {
+          status: "error",
+          message: "mode='direct' requires at least one combination.",
+        };
+      }
+
+      // ── Checklist principal ──
       const checklist: Array<{
         task: string;
         status: "todo" | "doing" | "done" | "failed";
         note?: string;
       }> = [
         { task: "Session Init", status: "done" },
-        { task: "Scouting Phase", status: "todo" },
-        { task: "Extractor Phase", status: "todo" },
-        { task: "Search Checklist", status: "todo" },
+        {
+          task: "Scouting Phase",
+          status: isDirect ? "done" : "todo",
+          ...(isDirect && { note: "Skipped (direct mode)" }),
+        },
+        {
+          task: "Extractor Phase",
+          status: isDirect ? "done" : "todo",
+          ...(isDirect && { note: "Skipped (direct mode)" }),
+        },
+        {
+          task: "Search Checklist",
+          status: isDirect ? "done" : "todo",
+          ...(isDirect && { note: "Pre-filled (direct mode)" }),
+        },
         { task: "Scraping Phase", status: "todo" },
         { task: "Final Report", status: "todo" },
       ];
@@ -110,6 +162,25 @@ export function register(api: any, config: any = {}) {
         checklist.push({ task: "Email Report", status: "todo" });
       }
 
+      // ── Search checklist: pre-rellenar en modo direct ──
+      const searchChecklist: Array<{
+        id: number;
+        description: string;
+        status: "todo" | "doing" | "done" | "failed";
+      }> = [];
+
+      if (isDirect) {
+        params.combinations.forEach((c: any, idx: number) => {
+          const ret = c.return_date ? ` ↩ ${c.return_date}` : "";
+          searchChecklist.push({
+            id: idx + 1,
+            description: `${c.origin} → ${c.destination} ${c.exact_date}${ret}`,
+            status: "todo",
+          });
+        });
+      }
+
+      // ── Construir plan ──
       const plan: PlanState = {
         session_id: params.session_id,
         transport: params.transport,
@@ -123,7 +194,7 @@ export function register(api: any, config: any = {}) {
           children: params.constraints.children ?? [],
         },
         checklist,
-        search_checklist: [],
+        search_checklist: searchChecklist,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
@@ -136,7 +207,8 @@ export function register(api: any, config: any = {}) {
 
       return {
         status: "success",
-        next_skill: "travel-train-scout",
+        mode,
+        next_skill: isDirect ? "travel-train-scrape" : "travel-train-scout",
         session_id: params.session_id,
       };
     },
