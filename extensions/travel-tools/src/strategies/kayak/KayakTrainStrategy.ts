@@ -1,11 +1,11 @@
-// extensions/travel-tools/src/strategies/KayakTrainStrategy.ts
+// extensions/travel-tools/src/strategies/kayak/KayakTrainStrategy.ts
 //
 // Implements TrainScraperStrategy for Kayak trains (kayak.es with
 // transportation_train_bus filter). Uses the same .nrc6 card markup as
 // flights; the only difference is the URL filter and the DB tables used.
 //
-// Wait strategy: two-phase progress-bar detection (same as KayakFlightStrategy).
-// Persists to train_itineraries / train_options via FlightDB.
+// Wait strategy: two-phase progress-bar detection.
+// Persists to train_itineraries / train_options via TravelDB.
 
 import {
   TrainScraperStrategy,
@@ -17,16 +17,17 @@ import { BatchResult } from "../FlightScraperStrategy";
 import { BaseBatchTrainScraperStrategy } from "../BaseBatchStrategy";
 import { TravelDB } from "../../utils/db";
 import { logger } from "../../utils/logger";
-import { McpBrowserSession } from "../../utils/mcp-browser";
+import { McpBrowserSession, BrowserDeadError } from "../../utils/mcp-browser";
 import * as scripts from "./kayak-scripts";
 import { buildKayakTrainUrl } from "./kayak-train-url";
 
 export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
-  // Override batch methods to control concurrency
   async scrapeTrainsBatch(
     params: BatchTrainSearchParams,
   ): Promise<BatchResult<TrainScraperResult>> {
-    const CONCURRENCY = 2; // Kayak is sensitive, keep it low
+    // Concurrency=1: Kayak is heavy (~400MB per Chrome tab) and two
+    // simultaneous instances frequently crash (OOM / CDP port death).
+    const CONCURRENCY = 1;
     return this.runWithConcurrencyLimit(
       params.items,
       (item) => this.scrapeTrains(item),
@@ -34,6 +35,7 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
       CONCURRENCY,
     );
   }
+
   get siteName() {
     return "kayak_train";
   }
@@ -71,11 +73,10 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
 
       // PHASE 1: wait for progress bar to disappear AND stabilize.
       // Kayak loads results in multiple rounds — the progress bar may go
-      // hidden briefly between rounds and then reappear for the next batch
-      // of slower providers.  We require the bar to stay hidden for
-      // STABILITY_CHECKS consecutive polls before considering it truly done.
-      const STABILITY_CHECKS = 3;   // consecutive "done" polls required
-      const MAX_POLLS = 45;         // 45 × 2s = 90s max
+      // hidden briefly between rounds then reappear. We require the bar to
+      // stay hidden for STABILITY_CHECKS consecutive polls.
+      const STABILITY_CHECKS = 3;
+      const MAX_POLLS = 45;
       let consecutiveDone = 0;
       let progressDone = false;
 
@@ -84,6 +85,14 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
           instance_id: browser.instance_id,
           script: scripts.KAYAK_CHECK_PROGRESS_DONE_JS,
         });
+
+        // BrowserDeadError is thrown by callTool when it detects 3+
+        // consecutive connection failures — we catch it outside this loop.
+        // If callTool returns a result with __connError, the browser is
+        // dying but hasn't hit the threshold yet — skip and let it throw
+        // on the next attempt.
+        if (check.__connError) continue;
+
         const data = this.parseResult(check);
         logger.info(
           `[KayakTrain] Progress poll ${i + 1}: done=${data.done} barFound=${data.found} consecutive=${consecutiveDone}`,
@@ -96,7 +105,6 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
             break;
           }
         } else {
-          // Bar reappeared — reset the counter
           consecutiveDone = 0;
         }
         await sleep(2_000);
@@ -108,22 +116,43 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
         );
       }
 
-      // PHASE 2: wait for at least one real card (max 20s extra)
+      // PHASE 2: wait for card count to stabilize.
+      // After the progress bar hides, Kayak may still be rendering cards
+      // from slower providers (Renfe loads after SNCF/iryo). We wait until
+      // the real card count stops growing for STABLE_ROUNDS consecutive polls.
+      const STABLE_ROUNDS = 4; // 4 × 3s = 12s of no new cards
+      const MAX_SETTLE_POLLS = 15; // 15 × 3s = 45s max settle time
+      let lastCount = 0;
+      let stableRounds = 0;
       let success = false;
-      for (let i = 0; i < 10; i++) {
+
+      for (let i = 0; i < MAX_SETTLE_POLLS; i++) {
         const check = await browser.callTool("execute_script", {
           instance_id: browser.instance_id,
-          script: scripts.KAYAK_CHECK_READY_JS,
+          script: scripts.KAYAK_CHECK_LOADED_JS,
         });
+
+        if (check.__connError) continue;
+
         const data = this.parseResult(check);
+        const currentCount = data.real ?? 0;
+
         logger.info(
-          `[KayakTrain] Cards poll ${i + 1}: cardsReady=${data.cardsReady} count=${data.realCount}`,
+          `[KayakTrain] Settle poll ${i + 1}: real=${currentCount} last=${lastCount} stable=${stableRounds}/${STABLE_ROUNDS}`,
         );
-        if (data.cardsReady) {
-          success = true;
-          break;
+
+        if (currentCount > 0 && currentCount === lastCount) {
+          stableRounds++;
+          if (stableRounds >= STABLE_ROUNDS) {
+            success = true;
+            break;
+          }
+        } else {
+          // New cards appeared — reset stability counter
+          stableRounds = 0;
         }
-        await sleep(2_000);
+        lastCount = currentCount;
+        await sleep(3_000);
       }
 
       if (!success) {
@@ -189,8 +218,6 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
         const legs: any[] = r.legs ?? [];
         if (legs.length === 0) continue;
 
-        // Prefer the total already parsed from DOM (.f8F1-multiple-ptc-price-label).
-        // Fall back to per-person * adults when only a single-pax search was done.
         let total_price: number;
         if (typeof r.totalPrice === "number" && r.totalPrice > 0) {
           total_price = r.totalPrice;
@@ -211,7 +238,7 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
           out_dep_time: outLeg.depTime ?? "",
           out_arr_time: outLeg.arrTime ?? "",
           out_duration: outLeg.duration ?? null,
-          out_changes: outLeg.stops ?? 0, // "stops" in DOM = "cambios" for trains
+          out_changes: outLeg.stops ?? 0,
           ret_dep_time: retLeg?.depTime ?? null,
           ret_arr_time: retLeg?.arrTime ?? null,
           ret_duration: retLeg?.duration ?? null,
@@ -232,7 +259,12 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
         url,
       };
     } catch (e: any) {
-      logger.error(`[KayakTrain] scrapeTrains error: ${e.message}`);
+      // Distinguish browser-dead from other errors for clearer logs
+      if (e instanceof BrowserDeadError) {
+        logger.error(`[KayakTrain] Browser died mid-scrape: ${e.message}`);
+      } else {
+        logger.error(`[KayakTrain] scrapeTrains error: ${e.message}`);
+      }
       db.logError(this.siteName, params.session_id, "scrapeTrains", e.message);
       return { status: "error", reason: e.message };
     } finally {
@@ -244,6 +276,9 @@ export class KayakTrainStrategy extends BaseBatchTrainScraperStrategy {
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   private parseResult(raw: any): any {
+    // Skip connection-error results
+    if (raw?.__connError) return {};
+
     if (typeof raw?.result === "string") {
       try {
         return JSON.parse(raw.result);
