@@ -9,6 +9,7 @@ extensions/**/node_modules
 extensions/**/*.sqlite
 extensions/**/logs
 extensions/**/scripts
+!extensions/travel-tools/scripts/kayak/
 !workspace/
 workspace/*
 !workspace/skills
