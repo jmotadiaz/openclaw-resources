@@ -18,7 +18,7 @@ import { TravelDB } from "../../src/utils/db";
 const { values: args } = parseArgs({
   options: {
     session: { type: "string", short: "s" },
-    db: { type: "string", default: resolve(__dirname, "../travel.sqlite") },
+    db: { type: "string", default: resolve(__dirname, "../../travel.sqlite") },
     type: { type: "string", default: "all" }, // train | flight | all
     out: { type: "string" },
     limit: { type: "string", default: "9999" },

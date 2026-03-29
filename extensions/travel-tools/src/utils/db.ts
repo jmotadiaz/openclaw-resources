@@ -479,6 +479,10 @@ export class TravelDB {
     );
   }
 
+  rawAll<T = any>(sql: string, ...params: any[]): T[] {
+    return this.db.prepare(sql).all(...params) as T[];
+  }
+
   queryScouts(origin: string, destination: string, months: string[]) {
     const placeholders = months.map(() => "?").join(",");
     const stmt = this.db.prepare(`
